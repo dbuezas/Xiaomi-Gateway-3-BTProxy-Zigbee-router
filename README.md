@@ -1,6 +1,6 @@
 # Xiaomi Gateway 3: Bluetooth proxy & Zigbee router
 
-[![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=dbuezas&repository=gw3-btproxy&category=integration)
+[![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=dbuezas&repository=Xiaomi-Gateway-3-BTProxy-Zigbee-router&category=integration)
 
 A Home Assistant integration that puts both radios of a Xiaomi Gateway 3 (ZNDMWG03LM) to work in a
 standard Home Assistant setup:
@@ -22,7 +22,7 @@ Both are optional and independent.
 
 ## Install
 
-1. Click the button above (or add `https://github.com/dbuezas/gw3-btproxy` as a custom repository in
+1. Click the button above (or add `https://github.com/dbuezas/Xiaomi-Gateway-3-BTProxy-Zigbee-router` as a custom repository in
    HACS, category Integration) and download it.
 2. Restart Home Assistant.
 3. [![Add the integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=gw3_btproxy)
