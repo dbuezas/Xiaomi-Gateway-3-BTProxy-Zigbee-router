@@ -35,12 +35,13 @@ class JoinZigbeeButton(GatewayEntity, ButtonEntity):
                 "The gateway's Zigbee chip is not on TCP 8888. Set the Xiaomi Gateway 3 integration's Zigbee mode to ZHA."
             )
         try:
-            net = await self.hass.async_add_executor_job(zigbee.zha_network, self.hass)
+            net = zigbee.zha_network(self.hass)
+            _LOGGER.info("Joining the gateway Zigbee chip to %s", net)
             await self.hass.services.async_call("zha", "permit", {"duration": PERMIT_SECONDS}, blocking=True)
             nwk = await zigbee.join(gateway.host, net)
             coordinator.router_joined(await gateway.boot_id())
         except Exception as err:  # noqa: BLE001
-            raise HomeAssistantError(f"Joining the Zigbee network failed: {err}") from err
+            raise HomeAssistantError(f"Joining the Zigbee network failed: {err!r}") from err
         _LOGGER.info("Gateway Zigbee chip joined channel %s PAN 0x%04X as router 0x%04X", net.channel, net.pan_id, nwk)
         self.hass.config_entries.async_update_entry(
             coordinator.entry, options={**coordinator.entry.options, CONF_ZIGBEE_ROUTER: True}

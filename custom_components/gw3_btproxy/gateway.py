@@ -103,7 +103,7 @@ class Gateway:
 
     async def install(self) -> bool:
         """Copy the bundled files to the gateway when they differ. Returns True when something changed."""
-        local = {name: hashlib.md5((BIN_DIR / name).read_bytes()).hexdigest() for name in GW_FILES}
+        local = await asyncio.get_running_loop().run_in_executor(None, _local_md5s)
         out = await self.run("cd " + GW_DIR + " && md5sum " + " ".join(GW_FILES) + " 2>/dev/null")
         remote = {line.split()[1]: line.split()[0] for line in out.splitlines() if len(line.split()) == 2}
         stale = [name for name in GW_FILES if remote.get(name) != local[name]]
@@ -128,6 +128,10 @@ class Gateway:
             await asyncio.sleep(8)
             await self.bt_mode("on")
         return True
+
+
+def _local_md5s() -> dict[str, str]:
+    return {name: hashlib.md5((BIN_DIR / name).read_bytes()).hexdigest() for name in GW_FILES}
 
 
 class _FileServer:

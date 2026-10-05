@@ -69,14 +69,18 @@ async def _configure(ezsp) -> None:
             raise ZigbeeError(f"setConfigurationValue {cid.name}: {status}")
 
 
-async def _wait_up(ezsp, start) -> None:
+async def _wait_up(ezsp, start, timeout: float = 90) -> None:
     import bellows.types as t
 
     with ezsp.wait_for_stack_status(t.sl_Status.NETWORK_UP) as up:
         (status,) = await start()
         if status != t.EmberStatus.SUCCESS:
             raise ZigbeeError(f"chip refused: {status}")
-        await asyncio.wait_for(up, 60)
+        try:
+            await asyncio.wait_for(up, timeout)
+        except TimeoutError:
+            (state,) = await ezsp.networkState()
+            raise ZigbeeError(f"no NETWORK_UP within {timeout:.0f} s (network state {state})") from None
 
 
 async def resume(host: str) -> None:
