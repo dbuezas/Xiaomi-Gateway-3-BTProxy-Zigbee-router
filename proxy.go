@@ -1,0 +1,767 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"sync"
+	"time"
+)
+
+// Proxy owns the BT chip: scanning, connections and GATT procedures.
+
+type Config struct {
+	MaxConn int
+	Active  bool
+	MaxMTU  uint16
+}
+
+const (
+	stConnecting = iota
+	stConnected  // link up, discovering services
+	stEstablished
+	stClosing
+)
+
+type Service struct {
+	UUID   []byte // little endian, 2 or 16 bytes
+	Handle uint16
+	Chars  []Char
+}
+
+type Char struct {
+	UUID   []byte
+	Handle uint16
+	Props  byte
+	Descs  []Desc
+}
+
+type Desc struct {
+	UUID   []byte
+	Handle uint16
+}
+
+type Conn struct {
+	addr     uint64
+	addrType byte
+	handle   byte
+	state    int
+	mtu      uint16
+	cached   bool // client has the services cached (CONNECT_V3_WITH_CACHE)
+	services []Service
+
+	link       chan Packet   // le_connection opened/closed while connecting
+	mtuEv      chan struct{} // gatt_mtu_exchanged
+	closed     chan struct{} // closed when the connection is dropped
+	lost       chan struct{} // closed when the link goes down during setup (lostReason says why)
+	lostReason int32
+	procMu     sync.Mutex  // one GATT procedure at a time per connection
+	proc       chan Packet // events of the running procedure
+}
+
+type Proxy struct {
+	bg  *BGAPI
+	cfg Config
+	api *Server
+
+	mu       sync.Mutex
+	conns    map[uint64]*Conn
+	byHandle map[byte]*Conn
+	btAddr   uint64
+	active   bool
+
+	connectMu sync.Mutex // the chip establishes one connection at a time
+	scanMu    sync.Mutex
+	scanning  bool
+	bootCh    chan Packet
+	lastAdv   time.Time
+}
+
+func NewProxy(bg *BGAPI, cfg Config) *Proxy {
+	return &Proxy{
+		bg:       bg,
+		cfg:      cfg,
+		conns:    map[uint64]*Conn{},
+		byHandle: map[byte]*Conn{},
+		active:   cfg.Active,
+		bootCh:   make(chan Packet, 1),
+	}
+}
+
+// ---------- chip setup ----------
+
+func (p *Proxy) Init() error {
+	var err error
+	for i := 0; i < 5; i++ {
+		if _, err = p.bg.Cmd(0x01, 0x00, nil, time.Second); err == nil { // system_hello
+			break
+		}
+	}
+	if err != nil {
+		logf("chip does not answer hello, pulsing reset GPIO")
+		gpioReset()
+	}
+	for len(p.bootCh) > 0 {
+		<-p.bootCh
+	}
+	// system_reset(0) has no response, only a boot event. (1 = DFU mode, the chip then goes silent.)
+	p.bg.w.Write([]byte{0x20, 0x01, 0x01, 0x01, 0x00})
+	select {
+	case b := <-p.bootCh:
+		if len(b.Payload) >= 6 {
+			logf("chip booted: stack %d.%d.%d", le16(b.Payload), le16(b.Payload[2:]), le16(b.Payload[4:]))
+		}
+	case <-time.After(4 * time.Second):
+		return fmt.Errorf("no boot event after reset")
+	}
+	r, err := p.bg.Cmd(0x01, 0x03, nil, 2*time.Second) // system_get_bt_address
+	if err != nil || len(r) < 6 {
+		return fmt.Errorf("get_bt_address: %v", err)
+	}
+	p.btAddr = macToU64(r[:6])
+	logf("chip address %s", macString(p.btAddr))
+	if p.cfg.MaxMTU > 23 {
+		if _, res, err := p.bg.CmdResult(0x09, 0x00, put16(p.cfg.MaxMTU)); err != nil || res != 0 { // gatt_set_max_mtu
+			logf("set_max_mtu: res=0x%x err=%v", res, err)
+		}
+	}
+	// Extended scan reports bypass the Xiaomi firmware's advert filter (legacy reports only carry Xiaomi adverts).
+	if _, res, err := p.bg.CmdResult(0x03, 0x1c, []byte{1}); err != nil || res != 0 {
+		return fmt.Errorf("set_discovery_extended_scan_response: res=0x%x err=%v", res, err)
+	}
+	p.scanning = false
+	return p.startScan()
+}
+
+func (p *Proxy) startScan() error {
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
+	return p.startScanLocked()
+}
+
+func (p *Proxy) startScanLocked() error {
+	p.bg.CmdResult(0x03, 0x03, nil) // end_procedure, in case
+	// full duty while idle; with open links leave the radio 40 % of the time for them
+	interval, window := uint16(16), uint16(16) // 10 ms / 10 ms
+	p.mu.Lock()
+	if len(p.byHandle) > 0 {
+		interval, window = 80, 48 // 50 ms / 30 ms
+	}
+	p.mu.Unlock()
+	scanType := byte(0)
+	if p.active {
+		scanType = 1
+	}
+	steps := []struct {
+		id   byte
+		args []byte
+	}{
+		{0x17, []byte{1, scanType}}, // set_discovery_type(1M, passive/active)
+		{0x16, append([]byte{1}, append(put16(interval), put16(window)...)...)}, // set_discovery_timing(1M, interval, window)
+		{0x18, []byte{1, 2}}, // start_discovery(1M, observation)
+	}
+	for _, s := range steps {
+		_, res, err := p.bg.CmdResult(0x03, s.id, s.args)
+		if err != nil || res != 0 {
+			return fmt.Errorf("scan setup 3.%d: res=0x%x err=%v", s.id, res, err)
+		}
+	}
+	p.scanning = true
+	p.lastAdv = time.Now()
+	return nil
+}
+
+func (p *Proxy) stopScanLocked() {
+	if p.scanning {
+		p.bg.CmdResult(0x03, 0x03, nil)
+		p.scanning = false
+	}
+}
+
+func (p *Proxy) SetActive(active bool) {
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
+	p.active = active
+	if p.scanning {
+		if err := p.startScanLocked(); err != nil {
+			logf("rescan: %v", err)
+		}
+	}
+}
+
+// gpioReset pulses the chip reset line, the same way daemon_miio.sh does.
+func gpioReset() {
+	const v = "/sys/class/gpio/gpio31/value"
+	if _, err := os.Stat(v); err != nil {
+		return
+	}
+	os.WriteFile(v, []byte("0"), 0)
+	time.Sleep(time.Second)
+	os.WriteFile(v, []byte("1"), 0)
+	time.Sleep(time.Second)
+}
+
+// ---------- event loop ----------
+
+func (p *Proxy) Run() {
+	go p.advLoop()
+	go p.watchdog()
+	for ev := range p.bg.Events {
+		p.onEvent(ev)
+	}
+	logf("chip link lost")
+	os.Exit(1)
+}
+
+func (p *Proxy) onEvent(ev Packet) {
+	pl := ev.Payload
+	switch {
+	case ev.Class == 0x01 && ev.ID == 0x00: // system_boot
+		select {
+		case p.bootCh <- ev:
+		default:
+		}
+	case ev.Class == 0x01 && ev.ID == 0x06: // system_error
+		logf("chip error event %v", ev)
+	case ev.Class == 0x08 && ev.ID == 0x00 && len(pl) >= 9: // le_connection_opened
+		if c := p.connByHandle(pl[8]); c != nil {
+			nonBlock(c.link, ev)
+		}
+	case ev.Class == 0x08 && ev.ID == 0x01 && len(pl) >= 3: // le_connection_closed
+		c := p.connByHandle(pl[2])
+		if c == nil {
+			return
+		}
+		switch c.state {
+		case stConnecting:
+			nonBlock(c.link, ev)
+		case stConnected: // during setup: setupLink decides about a retry
+			p.mu.Lock()
+			if c.lostReason == 0 {
+				c.lostReason = int32(le16(pl))
+				close(c.lost)
+			}
+			delete(p.byHandle, c.handle)
+			p.mu.Unlock()
+		default:
+			p.dropConn(c, int32(le16(pl)))
+		}
+	case ev.Class == 0x09 && len(pl) >= 1:
+		c := p.connByHandle(pl[0])
+		if c == nil {
+			return
+		}
+		switch {
+		case ev.ID == 0x00 && len(pl) >= 3: // gatt_mtu_exchanged
+			p.mu.Lock()
+			c.mtu = le16(pl[1:])
+			p.mu.Unlock()
+			select {
+			case c.mtuEv <- struct{}{}:
+			default:
+			}
+		case ev.ID == 0x04 && len(pl) >= 7 && (pl[3] == 0x1b || pl[3] == 0x1d): // notification / indication
+			p.api.NotifyData(c.addr, le16(pl[1:]), pl[7:])
+			if pl[3] == 0x1d {
+				go p.bg.CmdResult(0x09, 0x0d, []byte{c.handle}) // send_characteristic_confirmation
+			}
+		default:
+			p.mu.Lock()
+			ch := c.proc
+			p.mu.Unlock()
+			if ch != nil {
+				nonBlock(ch, ev)
+			}
+		}
+	default:
+		debugf("unhandled %v", ev)
+	}
+}
+
+func nonBlock(ch chan Packet, ev Packet) {
+	select {
+	case ch <- ev:
+	default:
+	}
+}
+
+func (p *Proxy) connByHandle(h byte) *Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.byHandle[h]
+}
+
+// advLoop batches advertisements for the API clients.
+func (p *Proxy) advLoop() {
+	tick := time.NewTicker(100 * time.Millisecond)
+	var batch []RawAdv
+	for {
+		select {
+		case ev := <-p.bg.Adv:
+			pl := ev.Payload
+			var a RawAdv
+			if ev.ID == 0x04 && len(pl) >= 18 { // extended_scan_response
+				a = RawAdv{Addr: macToU64(pl[1:7]), AddrType: pl[7], RSSI: int8(pl[13]), Data: pl[18:]}
+			} else if ev.ID == 0x00 && len(pl) >= 11 { // legacy scan_response
+				a = RawAdv{Addr: macToU64(pl[2:8]), AddrType: pl[8], RSSI: int8(pl[0]), Data: pl[11:]}
+			} else {
+				continue
+			}
+			if len(a.Data) > 62 {
+				a.Data = a.Data[:62]
+			}
+			p.mu.Lock()
+			p.lastAdv = time.Now()
+			p.mu.Unlock()
+			batch = append(batch, a)
+			if len(batch) >= 16 {
+				p.api.Adverts(batch)
+				batch = nil
+			}
+		case <-tick.C:
+			if len(batch) > 0 {
+				p.api.Adverts(batch)
+				batch = nil
+			}
+		}
+	}
+}
+
+// watchdog restarts scanning (or the whole chip) when adverts stop arriving.
+func (p *Proxy) watchdog() {
+	for range time.Tick(15 * time.Second) {
+		p.mu.Lock()
+		quiet := time.Since(p.lastAdv)
+		p.mu.Unlock()
+		if quiet < 60*time.Second {
+			continue
+		}
+		logf("no adverts for %v, restarting chip", quiet.Round(time.Second))
+		p.mu.Lock()
+		conns := make([]*Conn, 0, len(p.conns))
+		for _, c := range p.conns {
+			conns = append(conns, c)
+		}
+		p.mu.Unlock()
+		for _, c := range conns {
+			p.dropConn(c, 0x13e) // as "connection failed to be established"
+		}
+		if err := p.Init(); err != nil {
+			logf("re-init failed: %v", err)
+			gpioReset()
+		}
+	}
+}
+
+// ---------- connections ----------
+
+func (p *Proxy) ConnectionsFree() (free, limit int, allocated []uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for a := range p.conns {
+		allocated = append(allocated, a)
+	}
+	return p.cfg.MaxConn - len(p.conns), p.cfg.MaxConn, allocated
+}
+
+func (p *Proxy) Connect(addr uint64, addrType byte, cached bool) {
+	p.mu.Lock()
+	if c, ok := p.conns[addr]; ok {
+		state, mtu := c.state, c.mtu
+		p.mu.Unlock()
+		if state == stEstablished {
+			p.api.DeviceConnection(addr, true, mtu, 0)
+		}
+		return
+	}
+	if len(p.conns) >= p.cfg.MaxConn {
+		p.mu.Unlock()
+		logf("%s: no free connection slot", macString(addr))
+		p.api.DeviceConnection(addr, false, 0, 0)
+		return
+	}
+	c := &Conn{
+		addr: addr, addrType: addrType, cached: cached, state: stConnecting, mtu: 23,
+		link: make(chan Packet, 2), mtuEv: make(chan struct{}, 1), closed: make(chan struct{}), lost: make(chan struct{}),
+	}
+	p.conns[addr] = c
+	p.mu.Unlock()
+	p.api.ConnectionsFree()
+	go p.connect(c)
+}
+
+// connect sets up one link with scanning paused: the chip refuses to connect while discovering,
+// and a link that has to share the radio with a full-duty scan right away drops (0x23e).
+func (p *Proxy) connect(c *Conn) {
+	p.connectMu.Lock()
+	defer p.connectMu.Unlock()
+	p.scanMu.Lock()
+	p.stopScanLocked()
+	// a link that fails right after opening (0x23e, "failed to be established") usually works on a retry
+	var err int32
+	for try := 1; try <= 3; try++ {
+		if err = p.setupLink(c); err != 0x23e {
+			break
+		}
+		logf("%s: link failed to establish, retry %d", macString(c.addr), try)
+		p.mu.Lock()
+		if p.conns[c.addr] != c {
+			p.mu.Unlock()
+			break
+		}
+		delete(p.byHandle, c.handle)
+		c.state = stConnecting
+		c.link = make(chan Packet, 2)
+		c.mtuEv = make(chan struct{}, 1)
+		c.lost = make(chan struct{})
+		c.lostReason = 0
+		p.mu.Unlock()
+	}
+	if err := p.startScanLocked(); err != nil {
+		logf("resume scan: %v", err)
+	}
+	p.scanMu.Unlock()
+	if err != 0 {
+		logf("%s: connect failed: 0x%x", macString(c.addr), err)
+		if err != errNotConnected { // errNotConnected: already dropped and reported
+			p.closeLink(c)
+			p.dropConn(c, err)
+		}
+		return
+	}
+	p.mu.Lock()
+	c.state = stEstablished
+	mtu := c.mtu
+	p.mu.Unlock()
+	p.api.DeviceConnection(c.addr, true, mtu, 0)
+	p.api.ConnectionsFree()
+}
+
+// setupLink opens the link, waits for the MTU exchange and discovers the services unless the client has them.
+func (p *Proxy) setupLink(c *Conn) int32 {
+	if err := p.openLink(c); err != 0 {
+		return err
+	}
+	logf("%s: link up (conn %d)", macString(c.addr), c.handle)
+	select {
+	case <-c.mtuEv:
+	case <-time.After(1500 * time.Millisecond):
+	case <-c.lost:
+		return c.lostReason
+	case <-c.closed:
+		return errNotConnected
+	}
+	if !c.cached {
+		if err := p.discover(c); err != 0 {
+			if c.lostReason != 0 {
+				return c.lostReason
+			}
+			return err
+		}
+	}
+	return 0
+}
+
+func (p *Proxy) openLink(c *Conn) int32 {
+	r, res, err := p.bg.CmdResult(0x03, 0x1a, append(u64ToMac(c.addr), c.addrType, 1)) // le_gap_connect
+	if err != nil {
+		return 0x100
+	}
+	if res != 0 || len(r) < 3 {
+		return int32(res)
+	}
+	p.mu.Lock()
+	c.handle = r[2]
+	p.byHandle[c.handle] = c
+	p.mu.Unlock()
+	select {
+	case ev := <-c.link:
+		if ev.ID == 0x00 {
+			p.mu.Lock()
+			c.state = stConnected
+			p.mu.Unlock()
+			return 0
+		}
+		return int32(le16(ev.Payload))
+	case <-time.After(20 * time.Second):
+		// cancel the pending connection; the chip also needs end_procedure, else it stays in "wrong state"
+		p.bg.CmdResult(0x08, 0x04, []byte{c.handle})
+		select {
+		case <-c.link:
+		case <-time.After(3 * time.Second):
+		}
+		p.bg.CmdResult(0x03, 0x03, nil)
+		return 0x208 // connection timeout
+	}
+}
+
+func (p *Proxy) Disconnect(addr uint64) {
+	p.mu.Lock()
+	c, ok := p.conns[addr]
+	if ok && c.state != stConnecting {
+		c.state = stClosing
+	}
+	p.mu.Unlock()
+	if !ok {
+		p.api.DeviceConnection(addr, false, 0, 0)
+		p.api.ConnectionsFree()
+		return
+	}
+	if c.state == stConnecting {
+		return // openLink times out or completes; a later disconnect request closes it
+	}
+	if _, res, err := p.bg.CmdResult(0x08, 0x04, []byte{c.handle}); err != nil || res != 0 {
+		p.dropConn(c, 0)
+		return
+	}
+	select {
+	case <-c.closed:
+	case <-time.After(5 * time.Second):
+		p.dropConn(c, 0)
+	}
+}
+
+// closeLink closes an open link and waits for the chip to confirm.
+func (p *Proxy) closeLink(c *Conn) {
+	if p.connByHandle(c.handle) != c {
+		return
+	}
+	if _, res, err := p.bg.CmdResult(0x08, 0x04, []byte{c.handle}); err != nil || res != 0 {
+		return
+	}
+	select {
+	case <-c.closed:
+	case <-time.After(5 * time.Second):
+	}
+}
+
+// dropConn forgets a connection and tells the clients.
+func (p *Proxy) dropConn(c *Conn, reason int32) {
+	p.mu.Lock()
+	if p.conns[c.addr] != c {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.conns, c.addr)
+	if p.byHandle[c.handle] == c {
+		delete(p.byHandle, c.handle)
+	}
+	close(c.closed)
+	idle := len(p.byHandle) == 0
+	p.mu.Unlock()
+	if idle {
+		go func() { // back to full-duty scanning
+			if err := p.startScan(); err != nil {
+				logf("rescan: %v", err)
+			}
+		}()
+	}
+	logf("%s: disconnected (0x%x)", macString(c.addr), reason)
+	p.api.DeviceConnection(c.addr, false, 0, reason)
+	p.api.ConnectionsFree()
+}
+
+func (p *Proxy) conn(addr uint64) *Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c := p.conns[addr]
+	if c == nil || c.state == stConnecting || c.state == stClosing {
+		return nil
+	}
+	return c
+}
+
+// ---------- GATT ----------
+
+const errNotConnected = -1
+
+// gattProc runs one GATT procedure and collects its events until gatt_procedure_completed.
+func (p *Proxy) gattProc(c *Conn, id byte, args []byte) ([]Packet, int32) {
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	ch := make(chan Packet, 128)
+	p.mu.Lock()
+	c.proc = ch
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		c.proc = nil
+		p.mu.Unlock()
+	}()
+	_, res, err := p.bg.CmdResult(0x09, id, append([]byte{c.handle}, args...))
+	if err != nil {
+		return nil, 0x100
+	}
+	if res != 0 {
+		return nil, int32(res)
+	}
+	var evs []Packet
+	timeout := time.After(15 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			if ev.ID == 0x06 { // procedure_completed: connection, result
+				return evs, int32(le16(ev.Payload[1:]))
+			}
+			evs = append(evs, ev)
+		case <-c.closed:
+			return nil, errNotConnected
+		case <-c.lost:
+			return nil, errNotConnected
+		case <-timeout:
+			return nil, 0x100
+		}
+	}
+}
+
+func (p *Proxy) discover(c *Conn) int32 {
+	evs, res := p.gattProc(c, 0x01, nil) // discover_primary_services
+	if res != 0 {
+		return res
+	}
+	var svcs []Service
+	var svcRefs []uint32
+	for _, ev := range evs {
+		pl := ev.Payload
+		if ev.ID != 0x01 || len(pl) < 6 || len(pl) < 6+int(pl[5]) {
+			continue
+		}
+		svcs = append(svcs, Service{UUID: clone(pl[6 : 6+int(pl[5])])})
+		svcRefs = append(svcRefs, le32(pl[1:]))
+	}
+	for i := range svcs {
+		evs, res := p.gattProc(c, 0x03, put32(svcRefs[i])) // discover_characteristics
+		if res != 0 {
+			return res
+		}
+		for _, ev := range evs {
+			pl := ev.Payload
+			if ev.ID != 0x02 || len(pl) < 5 || len(pl) < 5+int(pl[4]) {
+				continue
+			}
+			svcs[i].Chars = append(svcs[i].Chars, Char{Handle: le16(pl[1:]), Props: pl[3], UUID: clone(pl[5 : 5+int(pl[4])])})
+		}
+		for j := range svcs[i].Chars {
+			ch := &svcs[i].Chars[j]
+			// Clients only need descriptors for the CCCD; looking them up costs ~0.4 s per characteristic.
+			if ch.Props&0x30 == 0 { // neither notify nor indicate
+				continue
+			}
+			evs, res := p.gattProc(c, 0x06, put16(ch.Handle)) // discover_descriptors
+			if res != 0 {
+				return res
+			}
+			for _, ev := range evs {
+				pl := ev.Payload
+				if ev.ID != 0x03 || len(pl) < 4 || len(pl) < 4+int(pl[3]) {
+					continue
+				}
+				ch.Descs = append(ch.Descs, Desc{Handle: le16(pl[1:]), UUID: clone(pl[4 : 4+int(pl[3])])})
+			}
+		}
+		// The chip's service reference is opaque; the declaration handle sits two below the first value handle.
+		svcs[i].Handle = uint16(svcRefs[i])
+		if len(svcs[i].Chars) > 0 {
+			svcs[i].Handle = svcs[i].Chars[0].Handle - 2
+		}
+	}
+	p.mu.Lock()
+	c.services = svcs
+	p.mu.Unlock()
+	return 0
+}
+
+func (p *Proxy) Services(addr uint64) ([]Service, int32) {
+	c := p.conn(addr)
+	if c == nil {
+		return nil, errNotConnected
+	}
+	p.mu.Lock()
+	svcs := c.services
+	p.mu.Unlock()
+	if svcs != nil {
+		return svcs, 0
+	}
+	if res := p.discover(c); res != 0 {
+		return nil, res
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return c.services, 0
+}
+
+func (p *Proxy) Read(addr uint64, handle uint16, descriptor bool) ([]byte, int32) {
+	c := p.conn(addr)
+	if c == nil {
+		return nil, errNotConnected
+	}
+	var evs []Packet
+	var res int32
+	if descriptor {
+		evs, res = p.gattProc(c, 0x0e, put16(handle)) // read_descriptor_value
+	} else {
+		evs, res = p.gattProc(c, 0x07, put16(handle)) // read_characteristic_value
+	}
+	if res != 0 {
+		return nil, res
+	}
+	var data []byte
+	for _, ev := range evs {
+		pl := ev.Payload
+		switch {
+		case ev.ID == 0x04 && len(pl) >= 7: // characteristic_value: conn, char, opcode, offset, len, data
+			data = append(data, pl[7:]...)
+		case ev.ID == 0x05 && len(pl) >= 6: // descriptor_value: conn, desc, offset, len, data
+			data = append(data, pl[6:]...)
+		}
+	}
+	return data, 0
+}
+
+func (p *Proxy) Write(addr uint64, handle uint16, data []byte, response, descriptor bool) int32 {
+	c := p.conn(addr)
+	if c == nil {
+		return errNotConnected
+	}
+	args := append(put16(handle), byte(len(data)))
+	args = append(args, data...)
+	if descriptor {
+		_, res := p.gattProc(c, 0x0f, args) // write_descriptor_value
+		return res
+	}
+	if !response {
+		c.procMu.Lock() // the chip rejects commands on a link with a procedure running
+		defer c.procMu.Unlock()
+		_, res, err := p.bg.CmdResult(0x09, 0x0a, append([]byte{c.handle}, args...)) // write_without_response
+		if err != nil {
+			return 0x100
+		}
+		return int32(res)
+	}
+	_, res := p.gattProc(c, 0x09, args) // write_characteristic_value
+	return res
+}
+
+func clone(b []byte) []byte { return append([]byte(nil), b...) }
+
+// ---------- addresses ----------
+
+// BGAPI addresses are little endian; ESPHome uses the MAC as a big endian uint64.
+func macToU64(b []byte) uint64 {
+	var v uint64
+	for i := 5; i >= 0; i-- {
+		v = v<<8 | uint64(b[i])
+	}
+	return v
+}
+
+func u64ToMac(v uint64) []byte {
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = byte(v >> (8 * i))
+	}
+	return b
+}
+
+func macString(v uint64) string {
+	return fmt.Sprintf("%02X:%02X:%02X:%02X:%02X:%02X", byte(v>>40), byte(v>>32), byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+}
