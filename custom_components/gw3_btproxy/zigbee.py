@@ -30,7 +30,7 @@ class ZigbeeError(Exception):
     """The chip did not do what was asked."""
 
 
-def zha_network(hass: HomeAssistant) -> Network:
+async def zha_network(hass: HomeAssistant) -> Network:
     """Channel, PAN ID and extended PAN ID of the running ZHA network."""
     try:
         from homeassistant.components.zha.helpers import get_zha_gateway
@@ -39,7 +39,11 @@ def zha_network(hass: HomeAssistant) -> Network:
         return Network(int(info.channel), int(info.pan_id), str(info.extended_pan_id))
     except Exception as err:  # noqa: BLE001  ZHA internals change between releases
         _LOGGER.debug("ZHA gateway API unavailable (%r), reading the ZHA network backup", err)
-    db = sqlite3.connect(f"file:{hass.config.path('zigbee.db')}?mode=ro", uri=True)
+    return await hass.async_add_executor_job(_zha_network_from_backup, hass.config.path("zigbee.db"))
+
+
+def _zha_network_from_backup(path: str) -> Network:
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         tables = [r[0] for r in db.execute("select name from sqlite_master where name like 'network_backups_v%'")]
         if not tables:
