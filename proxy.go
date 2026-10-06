@@ -56,6 +56,10 @@ type Conn struct {
 	lostReason int32
 	procMu     sync.Mutex  // one GATT procedure at a time per connection
 	proc       chan Packet // events of the running procedure
+
+	bonding byte       // the chip's bond handle for this device, 0xff = none
+	secMode byte       // le_connection_parameters security mode: 0 = not encrypted
+	pairCh  chan int32 // a pending Pair waits here for bonded / bonding_failed
 }
 
 type Proxy struct {
@@ -74,6 +78,10 @@ type Proxy struct {
 	scanning  bool
 	bootCh    chan Packet
 	lastAdv   time.Time
+
+	canPair  bool        // the chip firmware has a security manager (see initSecurity)
+	bondMu   sync.Mutex  // one bond listing at a time
+	bondList chan Packet // list_bonding_entry events while Unpair lists them
 }
 
 func NewProxy(bg *BGAPI, cfg Config) *Proxy {
@@ -128,6 +136,7 @@ func (p *Proxy) Init() error {
 	if _, res, err := p.bg.CmdResult(0x03, 0x1c, []byte{1}); err != nil || res != 0 {
 		return fmt.Errorf("set_discovery_extended_scan_response: res=0x%x err=%v", res, err)
 	}
+	p.initSecurity()
 	p.scanning = false
 	return p.startScan()
 }
@@ -155,6 +164,9 @@ func (p *Proxy) startScanLocked() error {
 		id   byte
 		args []byte
 	}{
+		// Every time, not once at boot: a stack that falls back to legacy reports passes only
+		// Xiaomi's adverts, so every other device vanishes while the watchdog still sees traffic.
+		{0x1c, []byte{1}},           // set_discovery_extended_scan_response(1)
 		{0x17, []byte{1, scanType}}, // set_discovery_type(1M, passive/active)
 		{0x16, append([]byte{1}, append(put16(interval), put16(window)...)...)}, // set_discovery_timing(1M, interval, window)
 		{0x18, []byte{1, 2}}, // start_discovery(1M, observation)
@@ -224,8 +236,29 @@ func (p *Proxy) onEvent(ev Packet) {
 		logf("chip error event %v", ev)
 	case ev.Class == 0x08 && ev.ID == 0x00 && len(pl) >= 9: // le_connection_opened
 		if c := p.connByHandle(pl[8]); c != nil {
+			if len(pl) >= 10 {
+				p.mu.Lock()
+				c.bonding = pl[9]
+				c.secMode = 0
+				p.mu.Unlock()
+			}
 			nonBlock(c.link, ev)
 		}
+	case ev.Class == 0x08 && ev.ID == 0x02 && len(pl) >= 8: // le_connection_parameters
+		if c := p.connByHandle(pl[0]); c != nil {
+			p.mu.Lock()
+			was := c.secMode
+			c.secMode = pl[7]
+			p.mu.Unlock()
+			if pl[7] != was {
+				logf("%s: security mode %d", macString(c.addr), pl[7])
+			}
+			if pl[7] > 0 {
+				p.pairResult(c, 0)
+			}
+		}
+	case ev.Class == 0x0f:
+		p.onSecurityEvent(ev)
 	case ev.Class == 0x08 && ev.ID == 0x01 && len(pl) >= 3: // le_connection_closed
 		c := p.connByHandle(pl[2])
 		if c == nil {
@@ -380,7 +413,7 @@ func (p *Proxy) Connect(addr uint64, addrType byte, cached bool) {
 		return
 	}
 	c := &Conn{
-		addr: addr, addrType: addrType, cached: cached, state: stConnecting, mtu: 23,
+		addr: addr, addrType: addrType, cached: cached, state: stConnecting, mtu: 23, bonding: 0xff,
 		link: make(chan Packet, 2), mtuEv: make(chan struct{}, 1), closed: make(chan struct{}), lost: make(chan struct{}),
 	}
 	p.conns[addr] = c
@@ -442,6 +475,7 @@ func (p *Proxy) setupLink(c *Conn) int32 {
 		return err
 	}
 	logf("%s: link up (conn %d)", macString(c.addr), c.handle)
+	go p.secureOnConnect(c)
 	select {
 	case <-c.mtuEv:
 	case <-time.After(1500 * time.Millisecond):

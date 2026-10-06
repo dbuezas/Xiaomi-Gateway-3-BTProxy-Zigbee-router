@@ -36,6 +36,7 @@ func main() {
 	maxConn := flag.Int("max-conn", 2, "simultaneous connections (the chip allows 2)")
 	active := flag.Bool("active", false, "active scanning")
 	maxMTU := flag.Uint("mtu", 247, "largest ATT MTU to offer (23 = never exchange)")
+	flag.StringVar(&passkeyFile, "passkeys", passkeyFile, "file of 'MAC PIN' lines: the PIN to type in when a device asks for one")
 	flag.String("tag", "", "ignored; '-tag silabs_ncp_bt' makes daemon_miio.sh treat this process as its BT app")
 	flag.BoolVar(&verbose, "v", false, "debug logging")
 	flag.Parse()

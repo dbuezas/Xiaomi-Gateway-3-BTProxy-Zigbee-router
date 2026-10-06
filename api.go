@@ -11,43 +11,52 @@ import (
 
 // ESPHome native API server (plaintext), only the parts a Bluetooth proxy needs.
 
+// ESPHome's own keepalive: ping a client quiet for 60 s, drop it after 2.5 times that.
 const (
-	msgHelloRequest                 = 1
-	msgHelloResponse                = 2
-	msgDisconnectRequest            = 5
-	msgDisconnectResponse           = 6
-	msgPingRequest                  = 7
-	msgPingResponse                 = 8
-	msgDeviceInfoRequest            = 9
-	msgDeviceInfoResponse           = 10
-	msgListEntitiesRequest          = 11
-	msgListEntitiesDoneResponse     = 19
-	msgSubscribeBLEAdvertisements   = 66
-	msgBluetoothDeviceRequest       = 68
-	msgBluetoothDeviceConnection    = 69
-	msgGATTGetServicesRequest       = 70
-	msgGATTGetServicesResponse      = 71
-	msgGATTGetServicesDone          = 72
-	msgGATTReadRequest              = 73
-	msgGATTReadResponse             = 74
-	msgGATTWriteRequest             = 75
-	msgGATTReadDescriptorRequest    = 76
-	msgGATTWriteDescriptorRequest   = 77
-	msgGATTNotifyRequest            = 78
-	msgGATTNotifyData               = 79
-	msgSubscribeConnectionsFree     = 80
-	msgConnectionsFreeResponse      = 81
-	msgGATTErrorResponse            = 82
-	msgGATTWriteResponse            = 83
-	msgGATTNotifyResponse           = 84
-	msgUnsubscribeBLEAdvertisements = 87
-	msgRawAdvertisementsResponse    = 93
-	msgScannerStateResponse         = 126
-	msgScannerSetModeRequest        = 127
+	keepaliveIdle = 60 * time.Second
+	keepaliveDrop = 90 * time.Second
+)
+
+const (
+	msgHelloRequest                     = 1
+	msgHelloResponse                    = 2
+	msgDisconnectRequest                = 5
+	msgDisconnectResponse               = 6
+	msgPingRequest                      = 7
+	msgPingResponse                     = 8
+	msgDeviceInfoRequest                = 9
+	msgDeviceInfoResponse               = 10
+	msgListEntitiesRequest              = 11
+	msgListEntitiesDoneResponse         = 19
+	msgSubscribeBLEAdvertisements       = 66
+	msgBluetoothDeviceRequest           = 68
+	msgBluetoothDeviceConnection        = 69
+	msgGATTGetServicesRequest           = 70
+	msgGATTGetServicesResponse          = 71
+	msgGATTGetServicesDone              = 72
+	msgGATTReadRequest                  = 73
+	msgGATTReadResponse                 = 74
+	msgGATTWriteRequest                 = 75
+	msgGATTReadDescriptorRequest        = 76
+	msgGATTWriteDescriptorRequest       = 77
+	msgGATTNotifyRequest                = 78
+	msgGATTNotifyData                   = 79
+	msgSubscribeConnectionsFree         = 80
+	msgConnectionsFreeResponse          = 81
+	msgGATTErrorResponse                = 82
+	msgGATTWriteResponse                = 83
+	msgGATTNotifyResponse               = 84
+	msgBluetoothDevicePairingResponse   = 85
+	msgBluetoothDeviceUnpairingResponse = 86
+	msgUnsubscribeBLEAdvertisements     = 87
+	msgRawAdvertisementsResponse        = 93
+	msgScannerStateResponse             = 126
+	msgScannerSetModeRequest            = 127
 
 	featurePassiveScan       = 1 << 0
 	featureActiveConnections = 1 << 1
 	featureRemoteCaching     = 1 << 2
+	featurePairing           = 1 << 3
 	featureRawAdvertisements = 1 << 5
 	featureStateAndMode      = 1 << 6
 
@@ -139,9 +148,27 @@ func (s *Server) handle(nc net.Conn) {
 		logf("API client %s gone", nc.RemoteAddr())
 	}()
 	r := bufio.NewReader(nc)
+	// Keepalive the way ESPHome devices do it: after keepaliveIdle with nothing received, ping the
+	// client; drop it only if keepaliveDrop more passes with nothing. Waiting for the CLIENT to ping is
+	// not enough: aioesphomeapi skips its own ping whenever it has received anything, so a client
+	// subscribed to adverts never pings, and a plain read deadline dropped Home Assistant every time
+	// it ran out.
+	pinged := false
 	for {
-		nc.SetReadDeadline(time.Now().Add(3 * time.Minute)) // HA pings every ~20 s
+		if pinged {
+			nc.SetReadDeadline(time.Now().Add(keepaliveDrop))
+		} else {
+			nc.SetReadDeadline(time.Now().Add(keepaliveIdle))
+		}
 		typ, payload, err := readFrame(r)
+		var ne net.Error
+		if err != nil && !pinged && errors.As(err, &ne) && ne.Timeout() {
+			debugf("API client %s quiet for %v, pinging", nc.RemoteAddr(), keepaliveIdle)
+			c.send(msgPingRequest, nil)
+			pinged = true
+			continue
+		}
+		pinged = false
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				logf("API client %s: %v", nc.RemoteAddr(), err)
@@ -183,7 +210,11 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 		w.String(6, s.info.Model)
 		w.String(12, "Xiaomi")
 		w.String(13, s.info.FriendlyName)
-		w.Uint(15, featurePassiveScan|featureActiveConnections|featureRemoteCaching|featureRawAdvertisements|featureStateAndMode)
+		features := uint64(featurePassiveScan | featureActiveConnections | featureRemoteCaching | featureRawAdvertisements | featureStateAndMode)
+		if s.proxy.canPair {
+			features |= featurePairing
+		}
+		w.Uint(15, features)
 		w.String(18, macString(s.proxy.btAddr))
 		c.send(msgDeviceInfoResponse, w.b)
 	case msgListEntitiesRequest:
@@ -205,7 +236,23 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 			s.proxy.Connect(addr, byte(f.Uint(4)), f.Uint(2) == 4)
 		case 1: // DISCONNECT
 			go s.proxy.Disconnect(addr)
-		default: // V1 connect, pairing and cache clearing are not supported
+		case 2: // PAIR
+			go func() {
+				ok, errCode := s.proxy.Pair(addr)
+				var w pb
+				w.Uint(1, addr)
+				w.Bool(2, ok)
+				w.Int32(3, errCode)
+				s.broadcast(msgBluetoothDevicePairingResponse, w.b, false)
+			}()
+		case 3: // UNPAIR
+			go func() {
+				var w pb
+				w.Uint(1, addr)
+				w.Bool(2, s.proxy.Unpair(addr))
+				s.broadcast(msgBluetoothDeviceUnpairingResponse, w.b, false)
+			}()
+		default: // V1 connect and cache clearing are not supported
 			s.DeviceConnection(addr, false, 0, 0)
 		}
 	case msgGATTGetServicesRequest:

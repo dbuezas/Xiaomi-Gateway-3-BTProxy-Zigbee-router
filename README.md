@@ -56,15 +56,21 @@ the Mi Home app.
 `gw3-btproxy` is a single static Go binary (MIPS, about 5 MB RAM) that owns the BT chip on `/dev/ttyS1`
 and speaks the ESPHome native API (plaintext) on port 6053. It supports raw advertisements, passive
 and active scanning, active connections (at most 2 at a time, a chip limit), GATT discovery, read,
-write, descriptors, notifications and indications. It does not support pairing, cache clearing or
-encryption.
+write, descriptors, notifications and indications. It does not support cache clearing or encryption,
+and it cannot pair: see below.
 
 What I found about the chip:
 
 - Silicon Labs chip, Bluetooth SDK 2.13.8 BGAPI at 115200 baud. Commands to the chip are raw BGAPI;
   everything from the chip is SLIP-framed. SLIP-framed commands fail with 0x0195 "command incomplete".
 - Xiaomi's firmware only forwards Xiaomi adverts in the legacy scan reports. With
-  `le_gap_set_discovery_extended_scan_response(1)` every advert comes through.
+  `le_gap_set_discovery_extended_scan_response(1)` every advert comes through. The proxy sets it again
+  every time it starts scanning.
+- The firmware has no security manager: every pairing command answers 0x0183 "not implemented", so
+  the chip cannot pair, and a device that insists on pairing (an eQ-3 thermostat with its PIN on, for
+  example) hangs up on it. The proxy checks at start and offers pairing to Home Assistant only when the
+  chip can do it; it then types in the PIN listed for the device in `/data/gw3-btproxy.passkeys`
+  (lines of `MAC PIN`).
 - `system_reset(1)` puts the chip in DFU mode and it goes silent until a GPIO reset. Use `system_reset(0)`.
 - A link that drops right after opening (0x23e) works on a retry, so the proxy retries up to 3 times.
 - `/bin/daemon_miio.sh` restarts Xiaomi's `silabs_ncp_bt` and pulses the chip reset (GPIO31) every ~7 s
