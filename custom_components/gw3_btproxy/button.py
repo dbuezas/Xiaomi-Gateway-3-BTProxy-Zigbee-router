@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.components.button import ButtonEntity
@@ -38,7 +39,7 @@ class JoinZigbeeButton(GatewayEntity, ButtonEntity):
             net = await zigbee.zha_network(self.hass)
             _LOGGER.info("Joining the gateway Zigbee chip to %s", net)
             await self.hass.services.async_call("zha", "permit", {"duration": PERMIT_SECONDS}, blocking=True)
-            nwk = await zigbee.join(gateway.host, net)
+            nwk = await asyncio.wait_for(zigbee.join(gateway.host, net), PERMIT_SECONDS + 30)
             coordinator.router_joined(await gateway.boot_id())
         except Exception as err:  # noqa: BLE001
             raise HomeAssistantError(f"Joining the Zigbee network failed: {err!r}") from err

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -18,6 +19,9 @@ _LOGGER = logging.getLogger(__name__)
 ROUTER_OFF = "off"
 ROUTER_UP = "up"
 ROUTER_ERROR = "error"
+
+# A hung connection to the Zigbee chip must not block every later poll (it did, for 21 hours).
+RESUME_TIMEOUT = 90
 
 
 class GatewayCoordinator(DataUpdateCoordinator[dict]):
@@ -43,7 +47,7 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
             if boot_id != self._router_boot_id:
                 # gateway rebooted or openmiio_agent restarted (or HA started): the chip may be reset
                 _LOGGER.info("Resuming the Zigbee router on %s", self.gateway.host)
-                await zigbee.resume(self.gateway.host)
+                await asyncio.wait_for(zigbee.resume(self.gateway.host), RESUME_TIMEOUT)
                 self._router_boot_id = boot_id
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Zigbee router on %s: %r", self.gateway.host, err)
