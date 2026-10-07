@@ -415,6 +415,7 @@ func (p *Proxy) watchdog() {
 		}
 		p.dropAll(0x13e)   // as "connection failed to be established"
 		p.connectMu.Lock() // no le_gap_connect may go out while the chip resets
+		p.dropAll(0x13e)   // a connect that slipped in before the lock was taken
 		err := p.Init()
 		p.connectMu.Unlock()
 		if err != nil {
@@ -502,7 +503,13 @@ func (p *Proxy) connect(c *Conn) {
 		}
 		logf("%s: link failed to establish, retry %d", macString(c.addr), try)
 		p.mu.Lock()
-		if p.conns[c.addr] != c {
+		cancelled := false
+		select {
+		case <-c.cancel:
+			cancelled = true
+		default:
+		}
+		if p.conns[c.addr] != c || c.state == stClosing || cancelled {
 			p.mu.Unlock()
 			break
 		}
@@ -522,6 +529,8 @@ func (p *Proxy) connect(c *Conn) {
 		logf("%s: connect failed: 0x%x", macString(c.addr), err)
 		switch err {
 		case errNotConnected: // already dropped and reported
+			p.closeLink(c)
+			p.dropConn(c, 0)
 		case errCancelled: // the client asked for the disconnect: report a plain one
 			p.closeLink(c)
 			p.dropConn(c, 0)
@@ -542,7 +551,12 @@ func (p *Proxy) connect(c *Conn) {
 	}
 	if p.conns[c.addr] != c || c.state == stClosing {
 		// dropped or being disconnected meanwhile: whoever did that reports it
+		dropped := p.conns[c.addr] != c
 		p.mu.Unlock()
+		if dropped {
+			p.closeLink(c)
+			p.dropConn(c, 0)
+		}
 		return
 	}
 	if lost == 0 {
@@ -569,11 +583,23 @@ func (p *Proxy) setupLink(c *Conn) int32 {
 	logf("%s: link up (conn %d)", macString(c.addr), c.handle)
 	go p.secureOnConnect(c)
 	p.mu.Lock()
-	mtuEv, lost := c.mtuEv, c.lost
+	mtuEv, lost, link := c.mtuEv, c.lost, c.link
 	p.mu.Unlock()
 	select {
 	case <-mtuEv:
 	case <-time.After(1500 * time.Millisecond):
+	case ev := <-link: // closed right after opened, before setup listened on c.lost
+		if ev.ID == 0x01 && len(ev.Payload) >= 2 {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.byHandle[c.handle] == c {
+				delete(p.byHandle, c.handle) // the link is gone: nothing to close any more
+			}
+			if c.lostReason == 0 {
+				c.lostReason = int32(le16(ev.Payload))
+			}
+			return c.lostReason
+		}
 	case <-lost:
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -649,6 +675,9 @@ func (p *Proxy) Disconnect(addr uint64) {
 	if ok && !connecting {
 		c.state = stClosing
 	}
+	if connecting {
+		c.cancelConnect() // under p.mu: connect's final check cannot slip past it
+	}
 	p.mu.Unlock()
 	if !ok {
 		p.api.DeviceConnection(addr, false, 0, 0)
@@ -656,8 +685,7 @@ func (p *Proxy) Disconnect(addr uint64) {
 		return
 	}
 	if connecting {
-		c.cancelConnect() // connect cancels the pending link, frees the slot and reports the disconnect
-		return
+		return // connect cancels the pending link, frees the slot and reports the disconnect
 	}
 	if _, res, err := p.bg.CmdResult(0x08, 0x04, []byte{c.handle}); err != nil || res != 0 {
 		p.dropConn(c, 0)
@@ -693,14 +721,24 @@ func (p *Proxy) closeLink(c *Conn) {
 // dropConn forgets a connection and tells the clients.
 func (p *Proxy) dropConn(c *Conn, reason int32) {
 	p.mu.Lock()
+	stale := false
+	if p.byHandle[c.handle] == c {
+		delete(p.byHandle, c.handle)
+		stale = p.conns[c.addr] != c
+	}
 	if p.conns[c.addr] != c {
+		idle := stale && len(p.byHandle) == 0
 		p.mu.Unlock()
+		if idle { // the last open link was a stale one: back to full-duty scanning
+			go func() {
+				if err := p.startScan(); err != nil {
+					logf("rescan: %v", err)
+				}
+			}()
+		}
 		return
 	}
 	delete(p.conns, c.addr)
-	if p.byHandle[c.handle] == c {
-		delete(p.byHandle, c.handle)
-	}
 	close(c.closed)
 	idle := len(p.byHandle) == 0
 	p.mu.Unlock()

@@ -13,6 +13,7 @@ from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from . import zigbee
@@ -33,15 +34,31 @@ RETRY_MAX = 3600  # failed router restores are retried after 4, 8, 16 ... minute
 
 class GatewayCoordinator(DataUpdateCoordinator[dict]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, gateway: Gateway) -> None:
-        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=UPDATE_INTERVAL))
+        super().__init__(
+            hass, _LOGGER, config_entry=entry, name=DOMAIN, update_interval=timedelta(seconds=UPDATE_INTERVAL)
+        )
         self.entry = entry
         self.gateway = gateway
         self.zigbee_lock = zigbee.chip_lock(gateway.host)
-        self._router_boot_id: str | None = None  # boot id at the last successful resume/join
+        # Boot id at the last successful resume/join, kept across HA restarts: while it matches, the router is
+        # up and the chip is left alone (every connection to it resets it). Cleared before each connection.
+        self._store: Store[dict] = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
+        self._router_boot_id: str | None = None
         self._router_state = ROUTER_OFF
         self._router_fails = 0
         self._router_retry_at = 0.0
         self._router_left = False  # the chip left ZHA but its own network was not restored yet
+        self._busy = False  # this instance's switch action holds the chip lock
+
+    async def async_load(self) -> None:
+        data = await self._store.async_load() or {}
+        self._router_boot_id = data.get("router_boot_id")
+        if self._router_boot_id:
+            self._router_state = ROUTER_UP
+
+    async def _set_boot_id(self, boot_id: str | None) -> None:
+        self._router_boot_id = boot_id
+        await self._store.async_save({"router_boot_id": boot_id})
 
     @property
     def router_option(self) -> bool:
@@ -69,22 +86,27 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
         if not self.router_option or self._router_left:
             return self._router_now()  # left ZHA, own network not restored: switching off again retries the restore
         if self.zigbee_lock.locked():
-            return self._router_state  # a switch action is using the chip
+            if self._busy:
+                return self._router_state  # this instance's switch action is using the chip
+            # after a reload the old instance may still be using it
+            return self._router_state if self._router_boot_id else ROUTER_ERROR
         if self._router_fails and time.monotonic() < self._router_retry_at:
             return ROUTER_ERROR
         async with self.zigbee_lock:
             try:
                 boot_id = await self.gateway.boot_id()
                 if boot_id != self._router_boot_id:
-                    # gateway rebooted or openmiio_agent restarted (or HA started): the chip may be reset
+                    # gateway rebooted or openmiio_agent restarted (or no boot id stored yet): the chip may be reset
                     if await zigbee.zha_uses_chip(self.hass, self.gateway.host):
                         raise zigbee.ZigbeeError("ZHA uses this chip as its own radio")
                     _LOGGER.info("Resuming the Zigbee router on %s", self.gateway.host)
                     net = await zigbee.zha_network(self.hass)
+                    await self._set_boot_id(None)
                     chip = await asyncio.wait_for(zigbee.probe(self.gateway.host), CHIP_TIMEOUT)
+                    await self._refuse_zha_coordinator(chip, net)
                     if not chip.is_router_of(net):
                         raise zigbee.ZigbeeError(f"the chip is not a router in the ZHA network ({chip})")
-                    self._router_boot_id = boot_id
+                    await self._set_boot_id(boot_id)
                 self._router_fails = 0
                 self._router_state = ROUTER_UP
             except Exception as err:  # noqa: BLE001
@@ -102,7 +124,11 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
         hass, host = self.hass, self.gateway.host
         if await zigbee.zha_uses_chip(hass, host):
             raise HomeAssistantError("ZHA uses this chip as its own radio; it cannot also be a router")
-        if not await self.gateway.zigbee_tcp():
+        try:
+            tcp = await self.gateway.zigbee_tcp()
+        except GatewayError as err:
+            raise HomeAssistantError(f"The gateway does not answer: {err}") from err
+        if not tcp:
             raise HomeAssistantError(
                 "The gateway's Zigbee chip is not on TCP 8888. Set the Xiaomi Gateway 3 integration's Zigbee mode to ZHA."
             )
@@ -121,12 +147,14 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
         if self.zigbee_lock.locked():
             raise HomeAssistantError("The Zigbee chip is busy; try again in a minute")
         async with self.zigbee_lock:
+            self._busy = True
             try:
                 await self._check_chip_reachable()
                 if not self.hass.services.has_service("zha", "permit"):
                     raise HomeAssistantError("ZHA is not set up")
                 await self._join_locked()
             finally:
+                self._busy = False
                 self._push_router_state()
 
     async def _join_locked(self) -> None:
@@ -134,6 +162,7 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
         saved, joining = None, False
         try:
             net = await zigbee.zha_network(hass)
+            await self._set_boot_id(None)
             chip = await asyncio.wait_for(zigbee.probe(host), CHIP_TIMEOUT)
             await self._refuse_zha_coordinator(chip, net)
             if not chip.is_router_of(net):
@@ -155,21 +184,30 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
                         _LOGGER.warning("Could not close ZHA pairing: %r", err)
                 _LOGGER.info("Gateway Zigbee chip joined channel %s PAN 0x%04X as router 0x%04X", net.channel, net.pan_id, nwk)
         except BaseException as err:  # also a cancel (HA stopping) in the middle of the join
-            if joining and saved:
-                # the join failed after the chip left its own network: give that network back now
+            joined = False
+            if joining and not isinstance(err, asyncio.CancelledError):
+                # the join may have completed after all (just as the timeout fired)
+                try:
+                    joined = (await asyncio.wait_for(zigbee.probe(host), CHIP_TIMEOUT)).is_router_of(net)
+                except Exception as perr:  # noqa: BLE001  unknown: restore below
+                    _LOGGER.warning("Could not check the chip after the failed join: %r", perr)
+            if joining and saved and not joined:
+                # the chip left its own network for the join: give that network back now
                 try:
                     await asyncio.wait_for(zigbee.restore(host, saved), 120)
                     _LOGGER.warning("Joining failed; the gateway's own Zigbee network was restored from %s", saved)
                 except Exception as rerr:  # noqa: BLE001
                     _LOGGER.error("Joining failed and restoring %s failed too: %r", saved, rerr)
-            if isinstance(err, (HomeAssistantError, asyncio.CancelledError)):
-                raise
-            raise HomeAssistantError(f"Turning the Zigbee router on failed: {err!r}") from err
+            if not joined:
+                if isinstance(err, (HomeAssistantError, asyncio.CancelledError)):
+                    raise
+                raise HomeAssistantError(f"Turning the Zigbee router on failed: {err!r}") from err
+            _LOGGER.warning("The join reported %r but the chip is a router in the ZHA network: keeping it", err)
         # joined (or already a router): from here on, failures are only warnings
         self._router_fails, self._router_left, self._router_state = 0, False, ROUTER_UP
         self._set_option(True)
         try:
-            self._router_boot_id = await self.gateway.boot_id()
+            await self._set_boot_id(await self.gateway.boot_id())
         except GatewayError as err:
             _LOGGER.warning("Could not read the gateway boot id (%r); the next poll checks the router", err)
 
@@ -179,10 +217,12 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
         if not self.router_option:
             return  # already off: never write an old backup over the chip's current network
         async with self.zigbee_lock:
+            self._busy = True
             try:
                 await self._check_chip_reachable()
                 await self._leave_locked()
             finally:
+                self._busy = False
                 self._push_router_state()
 
     async def _leave_locked(self) -> None:
@@ -193,6 +233,7 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
             except Exception as err:  # noqa: BLE001  ZHA removed: leave whatever network the router is in
                 _LOGGER.warning("ZHA's network is unknown (%r); leaving any network the chip routes for", err)
                 net = None
+            await self._set_boot_id(None)
             chip = await asyncio.wait_for(zigbee.probe(host), CHIP_TIMEOUT)
             await self._refuse_zha_coordinator(chip, net)
             if chip.node_type == "ROUTER" and (net is None or chip.is_router_of(net)):

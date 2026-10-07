@@ -90,7 +90,7 @@ What I found about the chip:
   while no process with that name runs. The proxy therefore runs as `gw3-btproxy -tag silabs_ncp_bt`.
   If the proxy dies, the daemon brings Xiaomi's app back by itself.
 
-`gateway/gw3-btproxy.sh on|off|status` switches between the two apps on the gateway; the mode is
+`gateway/gw3-btproxy.sh on|off|restore|status` switches between the two apps on the gateway; the mode is
 saved in `/data/gw3-btproxy.mode`.
 
 ### Optional: start the proxy on the gateway's own boot

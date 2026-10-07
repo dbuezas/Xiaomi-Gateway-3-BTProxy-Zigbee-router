@@ -35,13 +35,32 @@ alive() { [ -n "${1%%:*}" ] && [ "$(awk '{print $22}' /proc/${1%%:*}/stat 2>/dev
 lock() { # $1: seconds to wait
 	ME=$(me)
 	i=0
+	gcwait=0
 	while ! ln -s "$ME" $LOCK 2>/dev/null; do
 		H=$(readlink $LOCK 2>/dev/null)
-		if [ -n "$H" ] && ! alive "$H" && mkdir $LOCK.gc 2>/dev/null; then
-			# only one run removes a dead holder's lock, and only if it is still that one
-			[ "$(readlink $LOCK 2>/dev/null)" = "$H" ] && rm -f $LOCK && TOOK_OVER=1
-			rm -r $LOCK.gc
-			continue
+		if [ -n "$H" ] && ! alive "$H"; then
+			if mkdir $LOCK.gc 2>/dev/null; then
+				# only one run removes a dead holder's lock, and only if it is still that one. It resumes the
+				# daemon right here: another run may take the freed lock first, and it knows nothing of the pause.
+				GC=1
+				if [ "$(readlink $LOCK 2>/dev/null)" = "$H" ]; then
+					rm -f $LOCK
+					for d in $(daemon_pid); do kill -CONT $d 2>/dev/null; done
+				fi
+				GC=
+				rm -r $LOCK.gc
+				gcwait=0
+				continue
+			fi
+			# the takeover guard is held for a moment only: seen on 5 passes in a row (~4 s), its run died
+			gcwait=$((gcwait + 1))
+			if [ $gcwait -ge 5 ]; then
+				rm -r $LOCK.gc 2>/dev/null
+				gcwait=0
+				continue
+			fi
+		else
+			gcwait=0
 		fi
 		i=$((i + 1))
 		[ $i -ge "$1" ] && return 1
@@ -52,6 +71,7 @@ lock() { # $1: seconds to wait
 
 cleanup() {
 	for d in $D; do kill -CONT $d 2>/dev/null; done
+	[ -n "$GC" ] && rm -r $LOCK.gc 2>/dev/null
 	[ -n "$LOCKED" ] && [ "$(readlink $LOCK 2>/dev/null)" = "$ME" ] && rm -f $LOCK
 }
 trap "" HUP
@@ -109,15 +129,13 @@ esac
 WAIT=150
 [ "$1" = status ] && WAIT=0
 if lock $WAIT; then
-	# the previous holder was killed with -9, maybe while the daemon was paused
-	[ -n "$TOOK_OVER" ] && for d in $(daemon_pid); do kill -CONT $d 2>/dev/null; done
 	case "$1" in
 	on)
 		set_mode proxy || { echo "cannot save the mode (is /data full?)" >&2; exit 1; }
 		start
 		;;
 	off)
-		set_mode xiaomi
+		set_mode xiaomi || { echo "cannot save the mode (is /data full?)" >&2; exit 1; }
 		stop
 		;;
 	restore)
