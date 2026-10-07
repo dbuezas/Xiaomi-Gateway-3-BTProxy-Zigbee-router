@@ -37,10 +37,18 @@ The device "Xiaomi Gateway 3 radios" has three entities:
 | Entity | What it does |
 |---|---|
 | **Bluetooth proxy** (switch) | On: the proxy owns the gateway's BT chip; the integration adds it to ESPHome. Off: Xiaomi's own BT app runs, as before. |
-| **Join Zigbee network as router** (button) | Opens ZHA pairing for 2 minutes and joins the gateway's Zigbee chip as a router. |
-| **Zigbee router** (sensor) | `off`, `up` or `error`. After a gateway reboot the integration brings the router back by itself. |
+| **Zigbee router** (switch) | On: the gateway's Zigbee chip is a router in your ZHA network (it opens ZHA pairing for 2 minutes when it has to join). Off: it leaves ZHA and gets the gateway's own Zigbee network back. |
+| **Zigbee router state** (sensor) | `off`, `up` or `error`. After a gateway reboot the integration brings the router back by itself. |
 
-The Bluetooth mode is saved on the gateway and comes back after a reboot.
+Both settings persist: the Bluetooth mode is saved on the gateway, the Zigbee router setting in the integration.
+
+### Going back to the gateway's own Zigbee network
+
+Before the chip first joins ZHA, switching the Zigbee router on saves a backup of the gateway's own Zigbee network
+(zigpy open coordinator format, with the network key and the device list) to `/config/.storage/gw3_btproxy/`.
+Switching it off leaves ZHA and writes the newest backup back into the chip. Then set the Xiaomi Gateway 3
+integration's Zigbee mode back to Mi Home. If your config folder is in git, ignore that folder: the backups hold
+the network key.
 
 ### Xiaomi Bluetooth sensors
 

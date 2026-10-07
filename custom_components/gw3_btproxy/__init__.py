@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
 from .coordinator import GatewayCoordinator
@@ -15,7 +16,7 @@ from .gateway import Gateway, GatewayError
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.SWITCH, Platform.BUTTON, Platform.SENSOR]
+PLATFORMS = [Platform.SWITCH, Platform.SENSOR]
 
 type GatewayConfigEntry = ConfigEntry[GatewayCoordinator]
 
@@ -27,6 +28,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: GatewayConfigEntry) -> b
             _LOGGER.info("Installed gw3-btproxy on %s", gateway.host)
     except GatewayError as err:
         raise ConfigEntryNotReady(str(err)) from err
+    # the "Join Zigbee network as router" button (0.2.x) became the Zigbee router switch
+    registry = er.async_get(hass)
+    if old := registry.async_get_entity_id("button", DOMAIN, f"{entry.unique_id}_join_zigbee"):
+        registry.async_remove(old)
     coordinator = GatewayCoordinator(hass, entry, gateway)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator

@@ -7,9 +7,12 @@ networkInit, with stack profile 2 and security level 5 set first (otherwise it a
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
+import os
 import sqlite3
+import time
 from dataclasses import dataclass
 
 from homeassistant.core import HomeAssistant
@@ -87,16 +90,116 @@ async def _wait_up(ezsp, start, timeout: float = 90) -> None:
             raise ZigbeeError(f"no NETWORK_UP within {timeout:.0f} s (network state {state})") from None
 
 
-async def resume(host: str) -> None:
-    """Bring the stored router network up again (after any reset)."""
+def same_network(a: Network, b: Network) -> bool:
+    return a.channel == b.channel and a.pan_id == b.pan_id and a.extended_pan_id.lower() == b.extended_pan_id.lower()
+
+
+async def _stored_network(ezsp) -> Network:
+    _status, _node_type, params = await ezsp.getNetworkParameters()
+    return Network(int(params.radioChannel), int(params.panId), str(params.extendedPanId))
+
+
+async def resume(host: str) -> Network:
+    """Bring the stored router network up again (after any reset) and return it."""
     import bellows.types as t
 
     ezsp = await _connect(host)
     try:
         await _configure(ezsp)
         await _wait_up(ezsp, lambda: ezsp.networkInit(networkInitBitmask=t.EmberNetworkInitBitmask(0)))
+        return await _stored_network(ezsp)
     finally:
         await ezsp.disconnect()
+
+
+async def leave(host: str) -> None:
+    """Leave the network properly: bring it up first so the chip can announce its leave, then leave."""
+    import bellows.types as t
+
+    ezsp = await _connect(host)
+    try:
+        await _configure(ezsp)
+        try:
+            await _wait_up(ezsp, lambda: ezsp.networkInit(networkInitBitmask=t.EmberNetworkInitBitmask(0)), timeout=30)
+        except Exception as err:  # noqa: BLE001  nothing stored: nothing to leave
+            _LOGGER.debug("No stored network to leave (%r)", err)
+            return
+        await ezsp.leaveNetwork()
+    finally:
+        await ezsp.disconnect()
+
+
+# ---------- backup / restore of the chip's own (Xiaomi) network ----------
+# Before the chip first joins ZHA it is the coordinator of the gateway's own Zigbee network. A zigpy backup of that
+# network (open coordinator format, with the network key) is saved as a file; switching the router off writes the
+# newest backup back, so the chip is the coordinator of its old network again.
+
+
+def backup_dir(hass: HomeAssistant) -> str:
+    return hass.config.path(".storage", "gw3_btproxy")  # .storage: not in git, and the files hold network keys
+
+
+def _app(host: str):
+    from bellows.zigbee.application import ControllerApplication
+
+    return ControllerApplication({
+        "device": {"path": f"socket://{host}:{ZIGBEE_PORT}", "baudrate": 115200},
+        "backup_enabled": False,
+        "startup_energy_scan": False,
+        "database_path": None,
+        "use_thread": False,
+    })
+
+
+async def backup_if_coordinator(host: str, directory: str) -> str | None:
+    """Save a backup when the chip is the coordinator of a network (its own Xiaomi one). Returns the file name."""
+    app = _app(host)
+    try:
+        await app.connect()
+        try:
+            await app.load_network_info(load_devices=True)
+        except Exception as err:  # noqa: BLE001  no network formed
+            _LOGGER.debug("No network to back up (%r)", err)
+            return None
+        if app.state.node_info.nwk != 0x0000:
+            return None  # a router or end device: not the gateway's own network
+        backup = await app.backups.create_backup(load_devices=True)
+        name = os.path.join(directory, "zigbee-%s-%s.json" % (str(app.state.node_info.ieee).replace(":", ""), time.strftime("%Y%m%d-%H%M%S")))
+        await asyncio.get_running_loop().run_in_executor(None, _write_json, name, backup.as_open_coordinator_json())
+        _LOGGER.info("Backed up the gateway's Zigbee network to %s", name)
+        return name
+    finally:
+        await app.shutdown()
+
+
+def _write_json(path: str, obj) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=1)
+
+
+def _read_json(path: str):
+    with open(path) as f:
+        return json.load(f)
+
+
+def newest_backup(directory: str) -> str | None:  # call from an executor (file system)
+    files = sorted(glob.glob(os.path.join(directory, "zigbee-*.json")))
+    return files[-1] if files else None
+
+
+async def restore(host: str, path: str) -> None:
+    """Write a backup into the chip: it becomes the coordinator of that network again."""
+    import zigpy.backups
+
+    backup = zigpy.backups.NetworkBackup.from_dict(await asyncio.get_running_loop().run_in_executor(None, _read_json, path))
+    app = _app(host)
+    try:
+        await app.connect()
+        await app.backups.restore_backup(backup, counter_increment=5000)
+        _LOGGER.info("Restored the gateway's Zigbee network from %s", path)
+    finally:
+        await app.shutdown()
 
 
 async def join(host: str, net: Network) -> int:

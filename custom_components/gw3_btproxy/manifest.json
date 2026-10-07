@@ -1,13 +1,18 @@
 {
   "domain": "gw3_btproxy",
   "name": "Xiaomi Gateway 3 BT proxy & Zigbee router",
-  "after_dependencies": ["esphome", "zha"],
-  "codeowners": ["@dbuezas"],
+  "after_dependencies": [
+    "esphome",
+    "zha"
+  ],
+  "codeowners": [
+    "@dbuezas"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/dbuezas/Xiaomi-Gateway-3-BTProxy-Zigbee-router",
   "integration_type": "device",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/dbuezas/Xiaomi-Gateway-3-BTProxy-Zigbee-router/issues",
   "requirements": [],
-  "version": "0.2.5"
+  "version": "0.3.0"
 }

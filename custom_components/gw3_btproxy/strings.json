@@ -4,29 +4,36 @@
       "user": {
         "title": "Xiaomi Gateway 3",
         "description": "IP address of the gateway. Telnet must be open; the Xiaomi Gateway 3 integration opens it.",
-        "data": { "host": "Host" }
+        "data": {
+          "host": "Host"
+        }
       }
     },
     "error": {
       "cannot_connect": "Cannot reach the gateway over telnet.",
       "not_gateway": "This does not look like a Xiaomi Gateway 3."
     },
-    "abort": { "already_configured": "This gateway is already set up." }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "data": { "zigbee_router": "Keep the Zigbee chip running as a router (restore it after gateway reboots)" }
-      }
+    "abort": {
+      "already_configured": "This gateway is already set up."
     }
   },
   "entity": {
-    "switch": { "bluetooth_proxy": { "name": "Bluetooth proxy" } },
-    "button": { "join_zigbee": { "name": "Join Zigbee network as router" } },
+    "switch": {
+      "bluetooth_proxy": {
+        "name": "Bluetooth proxy"
+      },
+      "zigbee_router": {
+        "name": "Zigbee router"
+      }
+    },
     "sensor": {
       "zigbee_router": {
-        "name": "Zigbee router",
-        "state": { "off": "Off", "up": "Up", "error": "Error" }
+        "name": "Zigbee router state",
+        "state": {
+          "off": "Off",
+          "up": "Up",
+          "error": "Error"
+        }
       }
     }
   }
