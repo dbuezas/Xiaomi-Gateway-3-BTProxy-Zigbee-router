@@ -87,7 +87,8 @@ Home Assistant and telnet). With it, the gateway restores it by itself.
 
 `/etc/init.d/rcS` runs `/data/scripts/startup.sh` **instead of** the stock `startup.sh` when that file is
 executable. `gateway/startup.sh` therefore runs the stock `startup.sh` first, then runs
-`gw3-btproxy.sh status` in the background after 60 s. A broken hook could keep the gateway from booting
+`gw3-btproxy.sh restore` in the background after 60 s. With the hook installed, the integration's poll
+only reads the state; without it, the poll restores proxy mode within ~2 minutes after a reboot. A broken hook could keep the gateway from booting
 normally, so install it carefully:
 
 1. Write it as `/data/scripts/startup.sh.new` (not executable yet).

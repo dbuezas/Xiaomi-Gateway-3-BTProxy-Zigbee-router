@@ -33,7 +33,7 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
 
     async def _async_update_data(self) -> dict:
         try:
-            # in proxy mode "status" also restarts the proxy if it is not running (after a reboot)
+            # read-only when the gateway boot hook restores the mode; without the hook, "status" restores it
             bt = await self.gateway.bt_mode("status")
         except GatewayError as err:
             raise UpdateFailed(str(err)) from err

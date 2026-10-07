@@ -9,5 +9,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/dbuezas/Xiaomi-Gateway-3-BTProxy-Zigbee-router/issues",
   "requirements": [],
-  "version": "0.2.4"
+  "version": "0.2.5"
 }
