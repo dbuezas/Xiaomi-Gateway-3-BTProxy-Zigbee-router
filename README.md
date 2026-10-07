@@ -80,6 +80,23 @@ What I found about the chip:
 `gateway/gw3-btproxy.sh on|off|status` switches between the two apps on the gateway; the mode is
 saved in `/data/gw3-btproxy.mode`.
 
+### Optional: start the proxy on the gateway's own boot
+
+Without this, the integration restores proxy mode within ~2 minutes after a gateway reboot (it needs
+Home Assistant and telnet). With it, the gateway restores it by itself.
+
+`/etc/init.d/rcS` runs `/data/scripts/startup.sh` **instead of** the stock `startup.sh` when that file is
+executable. `gateway/startup.sh` therefore runs the stock `startup.sh` first, then runs
+`gw3-btproxy.sh status` in the background after 60 s. A broken hook could keep the gateway from booting
+normally, so install it carefully:
+
+1. Write it as `/data/scripts/startup.sh.new` (not executable yet).
+2. Check it on the gateway: `sh -n`, the checksum matches this file, the first line is `#!/bin/sh`, no
+   CR line endings.
+3. Only then: `chmod 755 /data/scripts/startup.sh.new && mv /data/scripts/startup.sh.new /data/scripts/startup.sh`.
+
+To undo, delete `/data/scripts/startup.sh`.
+
 ### Zigbee
 
 In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet NCP, EZSP v7) on TCP port
