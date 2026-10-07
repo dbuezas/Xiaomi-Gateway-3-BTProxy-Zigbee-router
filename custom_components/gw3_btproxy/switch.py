@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from homeassistant.components import persistent_notification
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_HOST, CONF_PORT
@@ -13,8 +12,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from . import GatewayConfigEntry, zigbee
-from .const import API_PORT, CONF_ZIGBEE_ROUTER
+from . import GatewayConfigEntry
+from .const import API_PORT
 from .entity import GatewayEntity
 from .gateway import GatewayError
 
@@ -41,10 +40,13 @@ class BluetoothProxySwitch(GatewayEntity, SwitchEntity):
 
     async def _set(self, action: str) -> None:
         try:
-            await self.coordinator.gateway.bt_mode(action)
+            running = await self.coordinator.gateway.bt_mode(action)
         except GatewayError as err:
             raise HomeAssistantError(str(err)) from err
-        await self.coordinator.async_request_refresh()
+        finally:
+            await self.coordinator.async_request_refresh()
+        if action == "on" and not running:
+            raise HomeAssistantError("The Bluetooth proxy did not stay up (Xiaomi's app runs). Try again.")
 
     async def _ensure_esphome_entry(self) -> None:
         """Add the proxy to the ESPHome integration, once."""
@@ -60,13 +62,12 @@ class BluetoothProxySwitch(GatewayEntity, SwitchEntity):
             if result["type"] == "create_entry":
                 _LOGGER.info("Added the gateway BT proxy to ESPHome")
                 return
+            if result["type"] == "abort" and result.get("reason") == "already_configured":
+                return  # ESPHome has it under another host name
             if result["type"] == "form":
                 self.hass.config_entries.flow.async_abort(result["flow_id"])
             await asyncio.sleep(3)
         _LOGGER.warning("Could not add %s:%s to ESPHome; add it by hand", host, API_PORT)
-
-
-PERMIT_SECONDS = 120
 
 
 class ZigbeeRouterSwitch(GatewayEntity, SwitchEntity):
@@ -77,57 +78,10 @@ class ZigbeeRouterSwitch(GatewayEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self.coordinator.entry.options.get(CONF_ZIGBEE_ROUTER))
+        return self.coordinator.router_option
 
     async def async_turn_on(self, **kwargs) -> None:
-        coordinator, gateway, hass = self.coordinator, self.coordinator.gateway, self.hass
-        if not hass.services.has_service("zha", "permit"):
-            raise HomeAssistantError("ZHA is not set up")
-        if not await gateway.zigbee_tcp():
-            raise HomeAssistantError(
-                "The gateway's Zigbee chip is not on TCP 8888. Set the Xiaomi Gateway 3 integration's Zigbee mode to ZHA."
-            )
-        try:
-            net = await zigbee.zha_network(hass)
-            # keep the gateway's own network, so switching off can give it back
-            saved = await asyncio.wait_for(zigbee.backup_if_coordinator(gateway.host, zigbee.backup_dir(hass)), 90)
-            if saved:
-                _LOGGER.info("Saved the gateway's own Zigbee network before joining: %s", saved)
-            # the chip may still hold this ZHA network (switched off and on again without restoring): resume is enough
-            try:
-                stored = await asyncio.wait_for(zigbee.resume(gateway.host), 90)
-            except Exception:  # noqa: BLE001
-                stored = None
-            if not (stored and zigbee.same_network(stored, net)):
-                await hass.services.async_call("zha", "permit", {"duration": PERMIT_SECONDS}, blocking=True)
-                nwk = await asyncio.wait_for(zigbee.join(gateway.host, net), PERMIT_SECONDS + 30)
-                _LOGGER.info("Gateway Zigbee chip joined channel %s PAN 0x%04X as router 0x%04X", net.channel, net.pan_id, nwk)
-            coordinator.router_joined(await gateway.boot_id())
-        except HomeAssistantError:
-            raise
-        except Exception as err:  # noqa: BLE001
-            raise HomeAssistantError(f"Turning the Zigbee router on failed: {err!r}") from err
-        hass.config_entries.async_update_entry(coordinator.entry, options={**coordinator.entry.options, CONF_ZIGBEE_ROUTER: True})
-        await coordinator.async_request_refresh()
+        await self.coordinator.router_on()
 
     async def async_turn_off(self, **kwargs) -> None:
-        coordinator, gateway, hass = self.coordinator, self.coordinator.gateway, self.hass
-        try:
-            await asyncio.wait_for(zigbee.leave(gateway.host), 90)
-            backup = await hass.async_add_executor_job(zigbee.newest_backup, zigbee.backup_dir(hass))
-            if backup:
-                await asyncio.wait_for(zigbee.restore(gateway.host, backup), 120)
-                persistent_notification.async_create(
-                    hass,
-                    "The gateway's Zigbee chip left the ZHA network and has its own network back "
-                    f"(from `{backup}`). To use it with Xiaomi's app again, set the Xiaomi Gateway 3 integration's "
-                    "Zigbee mode back to Mi Home.",
-                    title="Gateway Zigbee router off",
-                    notification_id="gw3_btproxy_zigbee_off",
-                )
-            else:
-                _LOGGER.warning("No backup of the gateway's own Zigbee network; the chip now has no network")
-        except Exception as err:  # noqa: BLE001
-            raise HomeAssistantError(f"Turning the Zigbee router off failed: {err!r}") from err
-        hass.config_entries.async_update_entry(coordinator.entry, options={**coordinator.entry.options, CONF_ZIGBEE_ROUTER: False})
-        await coordinator.async_request_refresh()
+        await self.coordinator.router_off()

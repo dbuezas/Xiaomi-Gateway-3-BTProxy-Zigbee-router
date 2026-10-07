@@ -62,6 +62,10 @@ class Gateway:
                     return out.replace("\r", "").strip("\n")
         finally:
             writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
     @staticmethod
     def _negotiate(data: bytes, writer: asyncio.StreamWriter) -> bytes:
@@ -85,17 +89,23 @@ class Gateway:
 
     async def bt_mode(self, action: str) -> bool:
         """Run gw3-btproxy.sh on|off|status; True when the proxy runs."""
-        out = await self.run(f"sh {GW_DIR}/gw3-btproxy.sh {action}", timeout=40)
-        return out.strip().splitlines()[-1:] == ["on"]
+        # a switch can wait up to 150 s for the lock (boot restore) and then needs up to 3 tries
+        out = await self.run(f"sh {GW_DIR}/gw3-btproxy.sh {action}", timeout=240)
+        lines = out.strip().splitlines()
+        if any(line.startswith(("busy:", "cannot save")) for line in lines):
+            raise GatewayError(f"gw3-btproxy.sh {action}: {lines[-1]}")
+        return lines[-1:] == ["on"]
 
     async def boot_id(self) -> str:
-        """Boot time (minute precision) plus the openmiio_agent pid; either change can reset the Zigbee chip."""
+        """The kernel's boot id plus the openmiio_agent pid; either change can reset the Zigbee chip."""
         out = await self.run(
-            'echo $(( $(date +%s) - $(cut -d. -f1 /proc/uptime) )) '
+            'echo $(cat /proc/sys/kernel/random/boot_id) '
             '$(ps | grep "openmiio_agent" | grep -v grep | awk "{print \\$1}")'
         )
         boot, _, pid = out.strip().partition(" ")
-        return f"{int(boot) // 60}:{pid}"
+        if not boot:
+            raise GatewayError("no boot id")
+        return f"{boot}:{pid}"
 
     async def zigbee_tcp(self) -> bool:
         """openmiio_agent serves the Zigbee chip on TCP 8888 (Xiaomi Gateway 3 integration in ZHA mode)."""
@@ -104,7 +114,9 @@ class Gateway:
     async def install(self) -> bool:
         """Copy the bundled files to the gateway when they differ. Returns True when something changed."""
         local = await asyncio.get_running_loop().run_in_executor(None, _local_md5s)
-        out = await self.run("cd " + GW_DIR + " && md5sum " + " ".join(GW_FILES) + " 2>/dev/null")
+        # chmod first: a file that was replaced but not made executable (interrupted install) is repaired here
+        files = " ".join(GW_FILES)
+        out = await self.run(f"cd {GW_DIR} && chmod +x {files} 2>/dev/null; md5sum {files} 2>/dev/null")
         remote = {line.split()[1]: line.split()[0] for line in out.splitlines() if len(line.split()) == 2}
         stale = [name for name in GW_FILES if remote.get(name) != local[name]]
         if not stale:
@@ -112,18 +124,24 @@ class Gateway:
         _LOGGER.info("Installing %s on gateway %s", ", ".join(stale), self.host)
         async with _FileServer(self.host) as url:
             for name in stale:
-                out = await self.run(
-                    f"wget -q -O {GW_DIR}/{name}.new {url}/{name} && md5sum {GW_DIR}/{name}.new", timeout=120
-                )
+                try:
+                    out = await self.run(
+                        f"rm -f {GW_DIR}/{name}.new; wget -q -O {GW_DIR}/{name}.new {url}/{name} && "
+                        f"chmod +x {GW_DIR}/{name}.new && md5sum {GW_DIR}/{name}.new",
+                        timeout=120,
+                    )
+                except GatewayError:
+                    out = ""
                 if local[name] not in out:
-                    await self.run(f"rm -f {GW_DIR}/{name}.new")
+                    try:
+                        await self.run(f"rm -f {GW_DIR}/{name}.new")
+                    except GatewayError:
+                        pass
                     raise GatewayError(f"download of {name} failed: {out!r}")
         was_on = "gw3-btproxy" in stale and await self.bt_mode("status")
         if was_on:  # the running binary is replaced; daemon_miio.sh starts Xiaomi's app meanwhile
             await self.run(f"kill $(ps -ww | grep '{GW_DIR}/gw3-btproxy -tag' | grep -v grep | awk '{{print $1}}')")
-        await self.run(
-            " && ".join(f"mv {GW_DIR}/{n}.new {GW_DIR}/{n} && chmod +x {GW_DIR}/{n}" for n in stale)
-        )
+        await self.run(" && ".join(f"mv {GW_DIR}/{n}.new {GW_DIR}/{n}" for n in stale))  # already executable
         if was_on:
             await asyncio.sleep(8)
             await self.bt_mode("on")
@@ -149,7 +167,8 @@ class _FileServer:
         site = web.TCPSite(self._runner, "0.0.0.0", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
-        return f"http://{_local_ip(self._gateway_host)}:{port}"
+        ip = await asyncio.get_running_loop().run_in_executor(None, _local_ip, self._gateway_host)
+        return f"http://{ip}:{port}"
 
     async def __aexit__(self, *exc) -> None:
         if self._runner:

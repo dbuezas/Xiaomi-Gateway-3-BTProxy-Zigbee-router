@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,8 @@ type Conn struct {
 	cached   bool // client has the services cached (CONNECT_V3_WITH_CACHE)
 	services []Service
 
+	cancel     chan struct{} // closed when the client gives up on a connect in progress
+	cancelOnce sync.Once
 	link       chan Packet   // le_connection opened/closed while connecting
 	mtuEv      chan struct{} // gatt_mtu_exchanged
 	closed     chan struct{} // closed when the connection is dropped
@@ -70,34 +73,46 @@ type Proxy struct {
 	mu       sync.Mutex
 	conns    map[uint64]*Conn
 	byHandle map[byte]*Conn
-	btAddr   uint64
-	active   bool
+	opened   map[byte]Packet // le_connection_opened that arrived before le_gap_connect's response was handled
+	btAddr   atomic.Uint64
+	active   atomic.Bool
 
-	connectMu sync.Mutex // the chip establishes one connection at a time
-	scanMu    sync.Mutex
-	scanning  bool
-	bootCh    chan Packet
-	lastAdv   time.Time
+	connectMu  sync.Mutex // the chip establishes one connection at a time
+	connecting atomic.Bool
+	needInit   atomic.Bool // the chip rebooted by itself
+	scanMu     sync.Mutex
+	scanning   bool // under scanMu
+	bootCh     chan Packet
+	initing    atomic.Bool
+	lastAdv    time.Time // under mu
 
-	canPair  bool        // the chip firmware has a security manager (see initSecurity)
+	canPair  atomic.Bool // the chip firmware has a security manager (see initSecurity)
 	bondMu   sync.Mutex  // one bond listing at a time
-	bondList chan Packet // list_bonding_entry events while Unpair lists them
+	bondList chan Packet // list_bonding_entry events while Unpair lists them (under mu)
 }
 
 func NewProxy(bg *BGAPI, cfg Config) *Proxy {
-	return &Proxy{
+	p := &Proxy{
 		bg:       bg,
 		cfg:      cfg,
 		conns:    map[uint64]*Conn{},
 		byHandle: map[byte]*Conn{},
-		active:   cfg.Active,
+		opened:   map[byte]Packet{},
 		bootCh:   make(chan Packet, 1),
 	}
+	p.active.Store(cfg.Active)
+	return p
 }
 
 // ---------- chip setup ----------
 
 func (p *Proxy) Init() error {
+	p.initing.Store(true)
+	defer p.initing.Store(false)
+	p.needInit.Store(false)
+	p.mu.Lock()
+	clear(p.opened)
+	p.mu.Unlock()
 	var err error
 	for i := 0; i < 5; i++ {
 		if _, err = p.bg.Cmd(0x01, 0x00, nil, time.Second); err == nil { // system_hello
@@ -125,8 +140,8 @@ func (p *Proxy) Init() error {
 	if err != nil || len(r) < 6 {
 		return fmt.Errorf("get_bt_address: %v", err)
 	}
-	p.btAddr = macToU64(r[:6])
-	logf("chip address %s", macString(p.btAddr))
+	p.btAddr.Store(macToU64(r[:6]))
+	logf("chip address %s", macString(p.btAddr.Load()))
 	if p.cfg.MaxMTU > 23 {
 		if _, res, err := p.bg.CmdResult(0x09, 0x00, put16(p.cfg.MaxMTU)); err != nil || res != 0 { // gatt_set_max_mtu
 			logf("set_max_mtu: res=0x%x err=%v", res, err)
@@ -137,8 +152,10 @@ func (p *Proxy) Init() error {
 		return fmt.Errorf("set_discovery_extended_scan_response: res=0x%x err=%v", res, err)
 	}
 	p.initSecurity()
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
 	p.scanning = false
-	return p.startScan()
+	return p.startScanLocked()
 }
 
 func (p *Proxy) startScan() error {
@@ -157,7 +174,7 @@ func (p *Proxy) startScanLocked() error {
 	}
 	p.mu.Unlock()
 	scanType := byte(0)
-	if p.active {
+	if p.active.Load() {
 		scanType = 1
 	}
 	steps := []struct {
@@ -178,7 +195,9 @@ func (p *Proxy) startScanLocked() error {
 		}
 	}
 	p.scanning = true
+	p.mu.Lock()
 	p.lastAdv = time.Now()
+	p.mu.Unlock()
 	return nil
 }
 
@@ -192,7 +211,7 @@ func (p *Proxy) stopScanLocked() {
 func (p *Proxy) SetActive(active bool) {
 	p.scanMu.Lock()
 	defer p.scanMu.Unlock()
-	p.active = active
+	p.active.Store(active)
 	if p.scanning {
 		if err := p.startScanLocked(); err != nil {
 			logf("rescan: %v", err)
@@ -228,6 +247,13 @@ func (p *Proxy) onEvent(ev Packet) {
 	pl := ev.Payload
 	switch {
 	case ev.Class == 0x01 && ev.ID == 0x00: // system_boot
+		if !p.initing.Load() {
+			// the chip rebooted by itself: every link is gone and it no longer scans. Let the watchdog set it up again.
+			logf("chip rebooted unexpectedly")
+			p.needInit.Store(true)
+			p.dropAll(0x13e)
+			return
+		}
 		select {
 		case p.bootCh <- ev:
 		default:
@@ -235,15 +261,20 @@ func (p *Proxy) onEvent(ev Packet) {
 	case ev.Class == 0x01 && ev.ID == 0x06: // system_error
 		logf("chip error event %v", ev)
 	case ev.Class == 0x08 && ev.ID == 0x00 && len(pl) >= 9: // le_connection_opened
-		if c := p.connByHandle(pl[8]); c != nil {
-			if len(pl) >= 10 {
-				p.mu.Lock()
-				c.bonding = pl[9]
-				c.secMode = 0
-				p.mu.Unlock()
-			}
-			nonBlock(c.link, ev)
+		p.mu.Lock()
+		c := p.byHandle[pl[8]]
+		if c == nil {
+			p.opened[pl[8]] = ev // openLink has not registered the handle yet
+			p.mu.Unlock()
+			return
 		}
+		if len(pl) >= 10 {
+			c.bonding = pl[9]
+			c.secMode = 0
+		}
+		link := c.link
+		p.mu.Unlock()
+		nonBlock(link, ev)
 	case ev.Class == 0x08 && ev.ID == 0x02 && len(pl) >= 8: // le_connection_parameters
 		if c := p.connByHandle(pl[0]); c != nil {
 			p.mu.Lock()
@@ -260,15 +291,19 @@ func (p *Proxy) onEvent(ev Packet) {
 	case ev.Class == 0x0f:
 		p.onSecurityEvent(ev)
 	case ev.Class == 0x08 && ev.ID == 0x01 && len(pl) >= 3: // le_connection_closed
-		c := p.connByHandle(pl[2])
+		p.mu.Lock()
+		delete(p.opened, pl[2])
+		c := p.byHandle[pl[2]]
 		if c == nil {
+			p.mu.Unlock()
 			return
 		}
 		switch c.state {
 		case stConnecting:
-			nonBlock(c.link, ev)
+			link := c.link
+			p.mu.Unlock()
+			nonBlock(link, ev)
 		case stConnected: // during setup: setupLink decides about a retry
-			p.mu.Lock()
 			if c.lostReason == 0 {
 				c.lostReason = int32(le16(pl))
 				close(c.lost)
@@ -276,6 +311,7 @@ func (p *Proxy) onEvent(ev Packet) {
 			delete(p.byHandle, c.handle)
 			p.mu.Unlock()
 		default:
+			p.mu.Unlock()
 			p.dropConn(c, int32(le16(pl)))
 		}
 	case ev.Class == 0x09 && len(pl) >= 1:
@@ -287,9 +323,10 @@ func (p *Proxy) onEvent(ev Packet) {
 		case ev.ID == 0x00 && len(pl) >= 3: // gatt_mtu_exchanged
 			p.mu.Lock()
 			c.mtu = le16(pl[1:])
+			mtuEv := c.mtuEv
 			p.mu.Unlock()
 			select {
-			case c.mtuEv <- struct{}{}:
+			case mtuEv <- struct{}{}:
 			default:
 			}
 		case ev.ID == 0x04 && len(pl) >= 7 && (pl[3] == 0x1b || pl[3] == 0x1d): // notification / indication
@@ -362,23 +399,25 @@ func (p *Proxy) advLoop() {
 // watchdog restarts scanning (or the whole chip) when adverts stop arriving.
 func (p *Proxy) watchdog() {
 	for range time.Tick(15 * time.Second) {
+		if p.connecting.Load() {
+			continue // scanning is paused while a link is set up (up to a minute for a large device)
+		}
 		p.mu.Lock()
 		quiet := time.Since(p.lastAdv)
 		p.mu.Unlock()
-		if quiet < 60*time.Second {
+		if quiet < 60*time.Second && !p.needInit.Load() {
 			continue
 		}
-		logf("no adverts for %v, restarting chip", quiet.Round(time.Second))
-		p.mu.Lock()
-		conns := make([]*Conn, 0, len(p.conns))
-		for _, c := range p.conns {
-			conns = append(conns, c)
+		if p.needInit.Load() {
+			logf("setting the chip up again after its reboot")
+		} else {
+			logf("no adverts for %v, restarting chip", quiet.Round(time.Second))
 		}
-		p.mu.Unlock()
-		for _, c := range conns {
-			p.dropConn(c, 0x13e) // as "connection failed to be established"
-		}
-		if err := p.Init(); err != nil {
+		p.dropAll(0x13e)   // as "connection failed to be established"
+		p.connectMu.Lock() // no le_gap_connect may go out while the chip resets
+		err := p.Init()
+		p.connectMu.Unlock()
+		if err != nil {
 			logf("re-init failed: %v", err)
 			gpioReset()
 		}
@@ -386,6 +425,22 @@ func (p *Proxy) watchdog() {
 }
 
 // ---------- connections ----------
+
+func (p *Proxy) dropAll(reason int32) {
+	p.mu.Lock()
+	conns := make([]*Conn, 0, len(p.conns))
+	for _, c := range p.conns {
+		conns = append(conns, c)
+	}
+	clear(p.opened)
+	p.mu.Unlock()
+	for _, c := range conns {
+		c.cancelConnect()
+		p.dropConn(c, reason)
+	}
+}
+
+func (c *Conn) cancelConnect() { c.cancelOnce.Do(func() { close(c.cancel) }) }
 
 func (p *Proxy) ConnectionsFree() (free, limit int, allocated []uint64) {
 	p.mu.Lock()
@@ -401,6 +456,7 @@ func (p *Proxy) Connect(addr uint64, addrType byte, cached bool) {
 	if c, ok := p.conns[addr]; ok {
 		state, mtu := c.state, c.mtu
 		p.mu.Unlock()
+		// stClosing: the old link's close (at most 5 s) answers with connected=false, and the client retries
 		if state == stEstablished {
 			p.api.DeviceConnection(addr, true, mtu, 0)
 		}
@@ -415,6 +471,7 @@ func (p *Proxy) Connect(addr uint64, addrType byte, cached bool) {
 	c := &Conn{
 		addr: addr, addrType: addrType, cached: cached, state: stConnecting, mtu: 23, bonding: 0xff,
 		link: make(chan Packet, 2), mtuEv: make(chan struct{}, 1), closed: make(chan struct{}), lost: make(chan struct{}),
+		cancel: make(chan struct{}),
 	}
 	p.conns[addr] = c
 	p.mu.Unlock()
@@ -427,6 +484,14 @@ func (p *Proxy) Connect(addr uint64, addrType byte, cached bool) {
 func (p *Proxy) connect(c *Conn) {
 	p.connectMu.Lock()
 	defer p.connectMu.Unlock()
+	p.connecting.Store(true)
+	defer p.connecting.Store(false)
+	select {
+	case <-c.cancel: // the client gave up while this connect waited for another one
+		p.dropConn(c, 0)
+		return
+	default:
+	}
 	p.scanMu.Lock()
 	p.stopScanLocked()
 	// a link that fails right after opening (0x23e, "failed to be established") usually works on a retry
@@ -455,16 +520,43 @@ func (p *Proxy) connect(c *Conn) {
 	p.scanMu.Unlock()
 	if err != 0 {
 		logf("%s: connect failed: 0x%x", macString(c.addr), err)
-		if err != errNotConnected { // errNotConnected: already dropped and reported
+		switch err {
+		case errNotConnected: // already dropped and reported
+		case errCancelled: // the client asked for the disconnect: report a plain one
+			p.closeLink(c)
+			p.dropConn(c, 0)
+		default:
 			p.closeLink(c)
 			p.dropConn(c, err)
 		}
 		return
 	}
 	p.mu.Lock()
-	c.state = stEstablished
+	lost := c.lostReason
+	select {
+	case <-c.cancel:
+		if lost == 0 {
+			lost = errCancelled
+		}
+	default:
+	}
+	if p.conns[c.addr] != c || c.state == stClosing {
+		// dropped or being disconnected meanwhile: whoever did that reports it
+		p.mu.Unlock()
+		return
+	}
+	if lost == 0 {
+		c.state = stEstablished
+	}
 	mtu := c.mtu
 	p.mu.Unlock()
+	if lost != 0 { // the link went down (or the client gave up) between setup and here
+		if lost == errCancelled {
+			p.closeLink(c)
+		}
+		p.dropConn(c, 0)
+		return
+	}
 	p.api.DeviceConnection(c.addr, true, mtu, 0)
 	p.api.ConnectionsFree()
 }
@@ -476,18 +568,28 @@ func (p *Proxy) setupLink(c *Conn) int32 {
 	}
 	logf("%s: link up (conn %d)", macString(c.addr), c.handle)
 	go p.secureOnConnect(c)
+	p.mu.Lock()
+	mtuEv, lost := c.mtuEv, c.lost
+	p.mu.Unlock()
 	select {
-	case <-c.mtuEv:
+	case <-mtuEv:
 	case <-time.After(1500 * time.Millisecond):
-	case <-c.lost:
+	case <-lost:
+		p.mu.Lock()
+		defer p.mu.Unlock()
 		return c.lostReason
 	case <-c.closed:
 		return errNotConnected
+	case <-c.cancel:
+		return errCancelled
 	}
 	if !c.cached {
 		if err := p.discover(c); err != 0 {
-			if c.lostReason != 0 {
-				return c.lostReason
+			p.mu.Lock()
+			lost := c.lostReason
+			p.mu.Unlock()
+			if lost != 0 {
+				return lost
 			}
 			return err
 		}
@@ -506,8 +608,20 @@ func (p *Proxy) openLink(c *Conn) int32 {
 	p.mu.Lock()
 	c.handle = r[2]
 	p.byHandle[c.handle] = c
+	if ev, ok := p.opened[c.handle]; ok { // the link opened before this goroutine got the response
+		delete(p.opened, c.handle)
+		nonBlock(c.link, ev)
+	}
 	p.mu.Unlock()
 	select {
+	case <-c.cancel:
+		p.bg.CmdResult(0x08, 0x04, []byte{c.handle})
+		select {
+		case <-c.link:
+		case <-time.After(3 * time.Second):
+		}
+		p.bg.CmdResult(0x03, 0x03, nil)
+		return errCancelled
 	case ev := <-c.link:
 		if ev.ID == 0x00 {
 			p.mu.Lock()
@@ -531,7 +645,8 @@ func (p *Proxy) openLink(c *Conn) int32 {
 func (p *Proxy) Disconnect(addr uint64) {
 	p.mu.Lock()
 	c, ok := p.conns[addr]
-	if ok && c.state != stConnecting {
+	connecting := ok && c.state == stConnecting
+	if ok && !connecting {
 		c.state = stClosing
 	}
 	p.mu.Unlock()
@@ -540,8 +655,9 @@ func (p *Proxy) Disconnect(addr uint64) {
 		p.api.ConnectionsFree()
 		return
 	}
-	if c.state == stConnecting {
-		return // openLink times out or completes; a later disconnect request closes it
+	if connecting {
+		c.cancelConnect() // connect cancels the pending link, frees the slot and reports the disconnect
+		return
 	}
 	if _, res, err := p.bg.CmdResult(0x08, 0x04, []byte{c.handle}); err != nil || res != 0 {
 		p.dropConn(c, 0)
@@ -559,11 +675,17 @@ func (p *Proxy) closeLink(c *Conn) {
 	if p.connByHandle(c.handle) != c {
 		return
 	}
+	p.mu.Lock()
+	link, lost := c.link, c.lost
+	p.mu.Unlock()
 	if _, res, err := p.bg.CmdResult(0x08, 0x04, []byte{c.handle}); err != nil || res != 0 {
 		return
 	}
+	// the closed event goes to c.link while connecting, to c.lost during setup, and to dropConn (c.closed) after
 	select {
 	case <-c.closed:
+	case <-lost:
+	case <-link:
 	case <-time.After(5 * time.Second):
 	}
 }
@@ -598,7 +720,7 @@ func (p *Proxy) conn(addr uint64) *Conn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c := p.conns[addr]
-	if c == nil || c.state == stConnecting || c.state == stClosing {
+	if c == nil || c.state != stEstablished {
 		return nil
 	}
 	return c
@@ -606,7 +728,10 @@ func (p *Proxy) conn(addr uint64) *Conn {
 
 // ---------- GATT ----------
 
-const errNotConnected = -1
+const (
+	errNotConnected = -1
+	errCancelled    = -2
+)
 
 // gattProc runs one GATT procedure and collects its events until gatt_procedure_completed.
 func (p *Proxy) gattProc(c *Conn, id byte, args []byte) ([]Packet, int32) {
@@ -615,6 +740,7 @@ func (p *Proxy) gattProc(c *Conn, id byte, args []byte) ([]Packet, int32) {
 	ch := make(chan Packet, 128)
 	p.mu.Lock()
 	c.proc = ch
+	lost := c.lost
 	p.mu.Unlock()
 	defer func() {
 		p.mu.Lock()
@@ -634,13 +760,18 @@ func (p *Proxy) gattProc(c *Conn, id byte, args []byte) ([]Packet, int32) {
 		select {
 		case ev := <-ch:
 			if ev.ID == 0x06 { // procedure_completed: connection, result
+				if len(ev.Payload) < 3 {
+					return nil, 0x100
+				}
 				return evs, int32(le16(ev.Payload[1:]))
 			}
 			evs = append(evs, ev)
 		case <-c.closed:
 			return nil, errNotConnected
-		case <-c.lost:
+		case <-lost:
 			return nil, errNotConnected
+		case <-c.cancel:
+			return nil, errCancelled
 		case <-timeout:
 			return nil, 0x100
 		}
@@ -755,6 +886,9 @@ func (p *Proxy) Write(addr uint64, handle uint16, data []byte, response, descrip
 	c := p.conn(addr)
 	if c == nil {
 		return errNotConnected
+	}
+	if len(data) > 255 { // BGAPI uint8array; long writes would need prepare/execute
+		return 0x0d // ATT: invalid attribute value length
 	}
 	args := append(put16(handle), byte(len(data)))
 	args = append(args, data...)

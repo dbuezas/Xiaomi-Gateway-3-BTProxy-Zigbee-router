@@ -46,9 +46,14 @@ Both settings persist: the Bluetooth mode is saved on the gateway, the Zigbee ro
 
 Before the chip first joins ZHA, switching the Zigbee router on saves a backup of the gateway's own Zigbee network
 (zigpy open coordinator format, with the network key and the device list) to `/config/.storage/gw3_btproxy/`.
-Switching it off leaves ZHA and writes the newest backup back into the chip. Then set the Xiaomi Gateway 3
-integration's Zigbee mode back to Mi Home. If your config folder is in git, ignore that folder: the backups hold
-the network key.
+The backup is read back and checked (same chip, same network, a network key) before anything else happens; if it
+fails, the chip does not join. Switching it off leaves ZHA and writes the newest backup of that chip back into it.
+Then set the Xiaomi Gateway 3 integration's Zigbee mode back to Mi Home. If your config folder is in git, ignore that
+folder: the backups hold the network key (the files are readable by their owner only).
+
+Safety checks: the switch refuses when ZHA uses this chip as its own radio, and does nothing when it is already
+off. If the chip joined ZHA with version 0.2.x, there is no backup: switching off then leaves it with no network
+(a notification says so), and its devices must be paired again in Mi Home.
 
 ### Xiaomi Bluetooth sensors
 
@@ -96,10 +101,12 @@ Home Assistant and telnet). With it, the gateway restores it by itself.
 `/etc/init.d/rcS` runs `/data/scripts/startup.sh` **instead of** the stock `startup.sh` when that file is
 executable. `gateway/startup.sh` therefore runs the stock `startup.sh` first, then runs
 `gw3-btproxy.sh restore` in the background after 60 s. With the hook installed, the integration's poll
-only reads the state; without it, the poll restores proxy mode within ~2 minutes after a reboot. A broken hook could keep the gateway from booting
+only reads the state. Tested on firmware 1.5.0_0102 only. A broken hook could keep the gateway from booting
 normally, so install it carefully:
 
-1. Write it as `/data/scripts/startup.sh.new` (not executable yet).
+0. Check first: `grep -n scripts /etc/init.d/rcS` shows the `CUSTOM_STARTUP=/data/scripts/startup.sh` line, and
+   `/data/scripts/startup.sh` does not exist yet (if it does, merge the `restore` line into it instead).
+1. Write it as `/data/scripts/startup.sh.new` (not executable yet; `mkdir -p /data/scripts` first).
 2. Check it on the gateway: `sh -n`, the checksum matches this file, the first line is `#!/bin/sh`, no
    CR line endings.
 3. Only then: `chmod 755 /data/scripts/startup.sh.new && mv /data/scripts/startup.sh.new /data/scripts/startup.sh`.
@@ -115,7 +122,7 @@ In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet NCP, EZS
 - Once joined, the chip routes on its own. No host needs to stay connected.
 - The chip keeps the network across resets, but like every NCP it only brings it up when a host calls
   `networkInit`, with stack profile 2 and security level 5 set first (otherwise it answers NOT_JOINED).
-  The integration does that whenever the gateway's boot time or the openmiio_agent process changes.
+  The integration does that whenever the gateway reboots (kernel boot id) or the openmiio_agent process changes.
 - Any connection to port 8888 resets the chip, so the integration only connects when needed.
 
 ## Development

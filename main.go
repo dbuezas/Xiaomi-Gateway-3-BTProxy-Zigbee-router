@@ -67,8 +67,8 @@ func main() {
 	if srv.info.MAC == "" {
 		// The chip address equals the gateway's WiFi MAC, which other integrations already use as device id.
 		// Set the locally administered bit so Home Assistant keeps this device separate.
-		srv.info.MAC = macString(p.btAddr | 0x02<<40)
+		srv.info.MAC = macString(p.btAddr.Load() | 0x02<<40)
 	}
-	fmt.Fprintf(os.Stderr, "gw3-btproxy %s ready, BT %s, API id %s\n", version, macString(p.btAddr), srv.info.MAC)
+	fmt.Fprintf(os.Stderr, "gw3-btproxy %s ready, BT %s, API id %s\n", version, macString(p.btAddr.Load()), srv.info.MAC)
 	log.Fatal(srv.Serve(*listen))
 }

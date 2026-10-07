@@ -11,9 +11,11 @@ import glob
 import json
 import logging
 import os
+import socket
 import sqlite3
 import time
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from homeassistant.core import HomeAssistant
 
@@ -31,6 +33,15 @@ class Network:
 
 class ZigbeeError(Exception):
     """The chip did not do what was asked."""
+
+
+# One lock per gateway, shared by every coordinator instance: a config entry reload must not let a new
+# coordinator open the chip while the old one is still using it.
+_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def chip_lock(host: str) -> asyncio.Lock:
+    return _LOCKS.setdefault(host, asyncio.Lock())
 
 
 async def zha_network(hass: HomeAssistant) -> Network:
@@ -59,12 +70,10 @@ def _zha_network_from_backup(path: str) -> Network:
     return Network(int(info["channel"]), int(info["pan_id"], 16), info["extended_pan_id"])
 
 
-async def _connect(host: str):
+def _ezsp(host: str):
     from bellows.ezsp import EZSP
 
-    ezsp = EZSP({"path": f"socket://{host}:{ZIGBEE_PORT}", "baudrate": 115200, "flow_control": None})
-    await ezsp.connect(use_thread=False)
-    return ezsp
+    return EZSP({"path": f"socket://{host}:{ZIGBEE_PORT}", "baudrate": 115200, "flow_control": None})
 
 
 async def _configure(ezsp) -> None:
@@ -94,39 +103,95 @@ def same_network(a: Network, b: Network) -> bool:
     return a.channel == b.channel and a.pan_id == b.pan_id and a.extended_pan_id.lower() == b.extended_pan_id.lower()
 
 
-async def _stored_network(ezsp) -> Network:
-    _status, _node_type, params = await ezsp.getNetworkParameters()
-    return Network(int(params.radioChannel), int(params.panId), str(params.extendedPanId))
+@dataclass
+class Chip:
+    """What the chip holds: its IEEE address, and the network it has stored (None: no network)."""
+
+    ieee: str
+    node_type: str | None = None  # "COORDINATOR", "ROUTER", ...
+    network: Network | None = None
+
+    def is_router_of(self, net: Network) -> bool:
+        return self.node_type == "ROUTER" and self.network is not None and same_network(self.network, net)
 
 
-async def resume(host: str) -> Network:
-    """Bring the stored router network up again (after any reset) and return it."""
+async def _init_stored(ezsp) -> Chip:
+    """Bring up whatever network the chip has stored, and describe it."""
     import bellows.types as t
 
-    ezsp = await _connect(host)
-    try:
-        await _configure(ezsp)
-        await _wait_up(ezsp, lambda: ezsp.networkInit(networkInitBitmask=t.EmberNetworkInitBitmask(0)))
-        return await _stored_network(ezsp)
-    finally:
-        await ezsp.disconnect()
-
-
-async def leave(host: str) -> None:
-    """Leave the network properly: bring it up first so the chip can announce its leave, then leave."""
-    import bellows.types as t
-
-    ezsp = await _connect(host)
-    try:
-        await _configure(ezsp)
+    (ieee,) = await ezsp.getEui64()
+    chip = Chip(str(ieee))
+    with ezsp.wait_for_stack_status(t.sl_Status.NETWORK_UP) as up:
+        (status,) = await ezsp.networkInit(networkInitBitmask=t.EmberNetworkInitBitmask(0))
+        if getattr(status, "name", "") == "NOT_JOINED":
+            return chip  # nothing stored
+        if status != t.EmberStatus.SUCCESS:
+            raise ZigbeeError(f"networkInit: {status}")
         try:
-            await _wait_up(ezsp, lambda: ezsp.networkInit(networkInitBitmask=t.EmberNetworkInitBitmask(0)), timeout=30)
-        except Exception as err:  # noqa: BLE001  nothing stored: nothing to leave
-            _LOGGER.debug("No stored network to leave (%r)", err)
-            return
-        await ezsp.leaveNetwork()
+            await asyncio.wait_for(up, 30)
+        except TimeoutError:
+            raise ZigbeeError("the stored network did not come up within 30 s") from None
+    _status, node_type, params = await ezsp.getNetworkParameters()
+    chip.node_type = getattr(node_type, "name", str(node_type))
+    chip.network = Network(int(params.radioChannel), int(params.panId), str(params.extendedPanId))
+    return chip
+
+
+async def probe(host: str) -> Chip:
+    """Bring the stored network up again (after any reset: this is also how the router is resumed) and describe it."""
+    ezsp = _ezsp(host)
+    try:
+        await ezsp.connect(use_thread=False)
+        await _configure(ezsp)
+        return await _init_stored(ezsp)
     finally:
         await ezsp.disconnect()
+
+
+async def reset(host: str) -> None:
+    """Reset the chip: every connection to it does. Stops whatever network the last probe brought up."""
+    ezsp = _ezsp(host)
+    try:
+        await ezsp.connect(use_thread=False)
+    finally:
+        await ezsp.disconnect()
+
+
+async def leave(host: str, net: Network | None) -> bool:
+    """Leave `net` (None: any network) if the chip is a router in it: bring it up first so the chip can
+    announce its leave. Returns False (and changes nothing) when the chip is not such a router."""
+    ezsp = _ezsp(host)
+    try:
+        await ezsp.connect(use_thread=False)
+        await _configure(ezsp)
+        chip = await _init_stored(ezsp)
+        if not (chip.is_router_of(net) if net else chip.node_type == "ROUTER"):
+            return False
+        await ezsp.leaveNetwork(timeout=15)  # raises unless the chip confirms it, and waits for NETWORK_DOWN
+        return True
+    finally:
+        await ezsp.disconnect()
+
+
+async def zha_uses_chip(hass: HomeAssistant, host: str) -> bool:
+    """ZHA's own radio is this chip (Xiaomi Gateway 3 integration's ZHA mode used as ZHA's coordinator)."""
+    for entry in hass.config_entries.async_entries("zha"):
+        url = urlparse(str((entry.data.get("device") or {}).get("path", "")))
+        try:
+            if url.port != ZIGBEE_PORT or not url.hostname:
+                continue
+        except ValueError:
+            continue
+        if url.hostname == host or await hass.async_add_executor_job(_same_host, url.hostname, host):
+            return True
+    return False
+
+
+def _same_host(a: str, b: str) -> bool:
+    try:
+        return socket.gethostbyname(a) == socket.gethostbyname(b)
+    except OSError:
+        return False
 
 
 # ---------- backup / restore of the chip's own (Xiaomi) network ----------
@@ -151,31 +216,48 @@ def _app(host: str):
     })
 
 
-async def backup_if_coordinator(host: str, directory: str) -> str | None:
-    """Save a backup when the chip is the coordinator of a network (its own Xiaomi one). Returns the file name."""
+async def backup(host: str, directory: str, chip: Chip) -> str:
+    """Save a backup of the network the chip coordinates (its own Xiaomi one). Raises unless the backup is complete."""
     app = _app(host)
     try:
         await app.connect()
-        try:
-            await app.load_network_info(load_devices=True)
-        except Exception as err:  # noqa: BLE001  no network formed
-            _LOGGER.debug("No network to back up (%r)", err)
-            return None
-        if app.state.node_info.nwk != 0x0000:
-            return None  # a router or end device: not the gateway's own network
+        await app.load_network_info(load_devices=True)
         backup = await app.backups.create_backup(load_devices=True)
-        name = os.path.join(directory, "zigbee-%s-%s.json" % (str(app.state.node_info.ieee).replace(":", ""), time.strftime("%Y%m%d-%H%M%S")))
-        await asyncio.get_running_loop().run_in_executor(None, _write_json, name, backup.as_open_coordinator_json())
-        _LOGGER.info("Backed up the gateway's Zigbee network to %s", name)
-        return name
     finally:
         await app.shutdown()
+    info = backup.network_info
+    if str(backup.node_info.ieee) != chip.ieee or chip.network is None or int(info.pan_id) != chip.network.pan_id:
+        raise ZigbeeError("the backup does not match the chip's network")
+    if bytes(info.network_key.key) in (bytes(16), b"\xff" * 16):
+        raise ZigbeeError("the backup has no network key")
+    name = os.path.join(directory, "zigbee-%s-%s.json" % (_ieee_tag(chip.ieee), time.strftime("%Y%m%d-%H%M%S")))
+    obj = backup.as_open_coordinator_json()
+    await asyncio.get_running_loop().run_in_executor(None, _write_json, name, obj)
+    import zigpy.backups
+
+    back = await asyncio.get_running_loop().run_in_executor(None, _read_json, name)
+    if back != json.loads(json.dumps(obj)) or not zigpy.backups.NetworkBackup.from_dict(back).is_complete():
+        raise ZigbeeError(f"the backup file {name} did not read back complete")
+    _LOGGER.info("Backed up the gateway's Zigbee network to %s", name)
+    return name
+
+
+def _ieee_tag(ieee: str) -> str:
+    return ieee.replace(":", "").lower()
 
 
 def _write_json(path: str, obj) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    """Write atomically, readable by the owner only (the backups hold the network key)."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    os.chmod(os.path.dirname(path), 0o700)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # also when a stale .tmp existed
+    with os.fdopen(fd, "w") as f:
         json.dump(obj, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def _read_json(path: str):
@@ -183,9 +265,15 @@ def _read_json(path: str):
         return json.load(f)
 
 
-def newest_backup(directory: str) -> str | None:  # call from an executor (file system)
-    files = sorted(glob.glob(os.path.join(directory, "zigbee-*.json")))
-    return files[-1] if files else None
+def newest_backup(directory: str, ieee: str) -> str | None:  # call from an executor (file system)
+    """The newest readable backup of this chip's own network."""
+    for path in sorted(glob.glob(os.path.join(directory, f"zigbee-{_ieee_tag(ieee)}-*.json")), reverse=True):
+        try:
+            _read_json(path)
+            return path
+        except (OSError, ValueError) as err:
+            _LOGGER.warning("Skipping the unreadable Zigbee backup %s (%r)", path, err)
+    return None
 
 
 async def restore(host: str, path: str) -> None:
@@ -206,8 +294,9 @@ async def join(host: str, net: Network) -> int:
     """Leave whatever network the chip has and join `net` as a router. The coordinator must permit joining."""
     import bellows.types as t
 
-    ezsp = await _connect(host)
+    ezsp = _ezsp(host)
     try:
+        await ezsp.connect(use_thread=False)
         await _configure(ezsp)
         try:
             await ezsp.leaveNetwork()

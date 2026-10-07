@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,13 @@ import (
 const (
 	keepaliveIdle = 60 * time.Second
 	keepaliveDrop = 90 * time.Second
+)
+
+const (
+	maxClients   = 4
+	clientQueue  = 128 // frames waiting for a slow client; adverts are dropped first, then the client
+	frameTimeout = 30 * time.Second
+	writeTimeout = 10 * time.Second
 )
 
 const (
@@ -82,16 +90,24 @@ type Server struct {
 
 	mu      sync.Mutex
 	clients map[*client]struct{}
+
+	opMu sync.Mutex
+	ops  map[uint64]chan func() // per device: GATT requests run one after the other, in arrival order
 }
 
+// client: frames are queued and written by the client's own goroutine, so a slow or vanished client
+// never blocks the chip's event loop.
 type client struct {
 	conn   net.Conn
-	wmu    sync.Mutex
-	advSub bool
+	out    chan []byte // nil: flush, then close
+	done   chan struct{}
+	wdone  chan struct{} // the writer has stopped
+	once   sync.Once
+	advSub atomic.Bool
 }
 
 func NewServer(p *Proxy, info DeviceInfo) *Server {
-	s := &Server{proxy: p, info: info, clients: map[*client]struct{}{}}
+	s := &Server{proxy: p, info: info, clients: map[*client]struct{}{}, ops: map[uint64]chan func(){}}
 	p.api = s
 	return s
 }
@@ -105,18 +121,65 @@ func (s *Server) Serve(addr string) error {
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
-			return err
+			// e.g. out of file descriptors: wait and go on, never end the proxy for it
+			logf("API accept: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		s.mu.Lock()
+		full := len(s.clients) >= maxClients
+		s.mu.Unlock()
+		if full {
+			logf("API client %s refused: %d clients already", nc.RemoteAddr(), maxClients)
+			nc.Close()
+			continue
 		}
 		go s.handle(nc)
 	}
 }
 
-func (c *client) send(typ int, payload []byte) {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := c.conn.Write(frame(typ, payload)); err != nil {
+func (c *client) close() {
+	c.once.Do(func() {
+		close(c.done)
 		c.conn.Close()
+	})
+}
+
+func (c *client) send(typ int, payload []byte) { c.queue(frame(typ, payload), false) }
+
+// queue never blocks. A full queue drops an advert batch; for anything else the client is too slow and is dropped.
+func (c *client) queue(f []byte, droppable bool) {
+	if droppable && len(c.out) >= clientQueue/2 {
+		return // adverts may use only half the queue: GATT replies and control frames always find room
+	}
+	select {
+	case <-c.done:
+	case c.out <- f:
+	default:
+		if !droppable {
+			logf("API client %s too slow, dropping it", c.conn.RemoteAddr())
+			c.close()
+		}
+	}
+}
+
+func (c *client) writer() {
+	defer close(c.wdone)
+	for {
+		select {
+		case f := <-c.out:
+			if f == nil {
+				c.close()
+				return
+			}
+			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if _, err := c.conn.Write(f); err != nil {
+				c.close()
+				return
+			}
+		case <-c.done:
+			return
+		}
 	}
 }
 
@@ -124,27 +187,82 @@ func (s *Server) broadcast(typ int, payload []byte, advOnly bool) {
 	s.mu.Lock()
 	cs := make([]*client, 0, len(s.clients))
 	for c := range s.clients {
-		if !advOnly || c.advSub {
+		if !advOnly || c.advSub.Load() {
 			cs = append(cs, c)
 		}
 	}
 	s.mu.Unlock()
+	if len(cs) == 0 {
+		return
+	}
+	f := frame(typ, payload)
 	for _, c := range cs {
-		c.send(typ, payload)
+		c.queue(f, advOnly)
+	}
+}
+
+// gattOp runs fn after the device's earlier GATT requests (write chunks must reach the device in order).
+func (s *Server) gattOp(addr uint64, fn func()) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	q, ok := s.ops[addr]
+	if !ok {
+		q = make(chan func(), 256)
+		s.ops[addr] = q
+		go s.runOps(addr, q)
+	}
+	select {
+	case q <- fn:
+	default:
+		logf("%s: GATT queue full", macString(addr))
+		go fn()
+	}
+}
+
+func (s *Server) runOps(addr uint64, q chan func()) {
+	idle := time.NewTimer(time.Minute)
+	defer idle.Stop()
+	for {
+		select {
+		case fn := <-q:
+			fn()
+			idle.Reset(time.Minute)
+		case <-idle.C:
+			s.opMu.Lock()
+			if len(q) == 0 {
+				delete(s.ops, addr)
+				s.opMu.Unlock()
+				return
+			}
+			s.opMu.Unlock()
+			idle.Reset(time.Minute)
+		}
 	}
 }
 
 func (s *Server) handle(nc net.Conn) {
-	c := &client{conn: nc}
+	c := &client{conn: nc, out: make(chan []byte, clientQueue), done: make(chan struct{}), wdone: make(chan struct{})}
 	logf("API client %s connected", nc.RemoteAddr())
 	s.mu.Lock()
 	s.clients[c] = struct{}{}
 	s.mu.Unlock()
+	go c.writer()
 	defer func() {
 		s.mu.Lock()
 		delete(s.clients, c)
 		s.mu.Unlock()
-		nc.Close()
+		// send what is queued (e.g. the DisconnectResponse) before closing
+		flush := time.After(2 * time.Second)
+		select {
+		case c.out <- nil:
+			select {
+			case <-c.wdone:
+			case <-flush:
+			}
+		case <-c.done:
+		case <-flush:
+		}
+		c.close()
 		logf("API client %s gone", nc.RemoteAddr())
 	}()
 	r := bufio.NewReader(nc)
@@ -160,7 +278,9 @@ func (s *Server) handle(nc net.Conn) {
 		} else {
 			nc.SetReadDeadline(time.Now().Add(keepaliveIdle))
 		}
-		typ, payload, err := readFrame(r)
+		// wait for the first byte with the keepalive deadline, then give the rest of the frame its own:
+		// a deadline that fires mid-frame would lose the bytes already read
+		_, err := r.Peek(1)
 		var ne net.Error
 		if err != nil && !pinged && errors.As(err, &ne) && ne.Timeout() {
 			debugf("API client %s quiet for %v, pinging", nc.RemoteAddr(), keepaliveIdle)
@@ -169,6 +289,12 @@ func (s *Server) handle(nc net.Conn) {
 			continue
 		}
 		pinged = false
+		var typ int
+		var payload []byte
+		if err == nil {
+			nc.SetReadDeadline(time.Now().Add(frameTimeout))
+			typ, payload, err = readFrame(r)
+		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				logf("API client %s: %v", nc.RemoteAddr(), err)
@@ -211,22 +337,26 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 		w.String(12, "Xiaomi")
 		w.String(13, s.info.FriendlyName)
 		features := uint64(featurePassiveScan | featureActiveConnections | featureRemoteCaching | featureRawAdvertisements | featureStateAndMode)
-		if s.proxy.canPair {
+		if s.proxy.canPair.Load() {
 			features |= featurePairing
 		}
 		w.Uint(15, features)
-		w.String(18, macString(s.proxy.btAddr))
+		w.String(18, macString(s.proxy.btAddr.Load()))
 		c.send(msgDeviceInfoResponse, w.b)
 	case msgListEntitiesRequest:
 		c.send(msgListEntitiesDoneResponse, nil)
 	case msgSubscribeBLEAdvertisements:
-		c.advSub = true
+		c.advSub.Store(true)
 		s.sendScannerState(c)
 	case msgUnsubscribeBLEAdvertisements:
-		c.advSub = false
+		c.advSub.Store(false)
 	case msgScannerSetModeRequest:
-		s.proxy.SetActive(f.Uint(1) == 1)
-		s.broadcastScannerState()
+		// not inline: a connect in progress holds the scan lock for up to a minute, and this client's pings must go on
+		active := f.Uint(1) == 1
+		go func() {
+			s.proxy.SetActive(active)
+			s.broadcastScannerState()
+		}()
 	case msgSubscribeConnectionsFree:
 		s.ConnectionsFree()
 	case msgBluetoothDeviceRequest:
@@ -237,29 +367,30 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 		case 1: // DISCONNECT
 			go s.proxy.Disconnect(addr)
 		case 2: // PAIR
-			go func() {
+			s.gattOp(addr, func() {
 				ok, errCode := s.proxy.Pair(addr)
 				var w pb
 				w.Uint(1, addr)
 				w.Bool(2, ok)
 				w.Int32(3, errCode)
 				s.broadcast(msgBluetoothDevicePairingResponse, w.b, false)
-			}()
+			})
 		case 3: // UNPAIR
-			go func() {
+			s.gattOp(addr, func() {
 				var w pb
 				w.Uint(1, addr)
 				w.Bool(2, s.proxy.Unpair(addr))
 				s.broadcast(msgBluetoothDeviceUnpairingResponse, w.b, false)
-			}()
+			})
 		default: // V1 connect and cache clearing are not supported
 			s.DeviceConnection(addr, false, 0, 0)
 		}
 	case msgGATTGetServicesRequest:
-		go s.sendServices(f.Uint(1))
+		addr := f.Uint(1)
+		s.gattOp(addr, func() { s.sendServices(addr) })
 	case msgGATTReadRequest, msgGATTReadDescriptorRequest:
 		addr, handle := f.Uint(1), uint16(f.Uint(2))
-		go func() {
+		s.gattOp(addr, func() {
 			data, res := s.proxy.Read(addr, handle, typ == msgGATTReadDescriptorRequest)
 			if res != 0 {
 				s.gattError(addr, handle, res)
@@ -270,7 +401,7 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 			w.Uint(2, uint64(handle))
 			w.Bytes(3, data)
 			s.broadcast(msgGATTReadResponse, w.b, false)
-		}()
+		})
 	case msgGATTWriteRequest, msgGATTWriteDescriptorRequest:
 		addr, handle := f.Uint(1), uint16(f.Uint(2))
 		descriptor := typ == msgGATTWriteDescriptorRequest
@@ -279,7 +410,7 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 		if descriptor {
 			data = clone(f.Bytes(3))
 		}
-		go func() {
+		s.gattOp(addr, func() {
 			if res := s.proxy.Write(addr, handle, data, response, descriptor); res != 0 {
 				s.gattError(addr, handle, res)
 				return
@@ -290,7 +421,7 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 				w.Uint(2, uint64(handle))
 				s.broadcast(msgGATTWriteResponse, w.b, false)
 			}
-		}()
+		})
 	case msgGATTNotifyRequest:
 		// Like ESPHome: only acknowledge, the client writes the CCCD itself. The chip reports every notification.
 		addr, handle := f.Uint(1), uint16(f.Uint(2))
@@ -310,7 +441,7 @@ func (s *Server) dispatch(c *client, typ int, f pbFields) bool {
 
 func (s *Server) sendScannerState(c *client) {
 	mode := uint64(0)
-	if s.proxy.active {
+	if s.proxy.active.Load() {
 		mode = 1
 	}
 	var w pb
@@ -341,6 +472,9 @@ func (s *Server) gattError(addr uint64, handle uint16, res int32) {
 }
 
 func uuidField(w *pb, uuidField, shortField int, uuid []byte) {
+	if len(uuid) != 2 && len(uuid) != 4 && len(uuid) != 16 {
+		return // not a UUID: a corrupted chip frame
+	}
 	if len(uuid) == 2 || len(uuid) == 4 {
 		var v uint64
 		for i := len(uuid) - 1; i >= 0; i-- {

@@ -48,8 +48,8 @@ func passkeyFor(addr uint64) int32 {
 // answers every class 0x0F command 0x0183 "not implemented"; pairing then stays off and is not offered.
 func (p *Proxy) initSecurity() {
 	_, res, err := p.bg.CmdResult(0x0f, 0x01, []byte{0x00, 2}) // sm_configure(flags 0, keyboard only)
-	p.canPair = err == nil && res == 0
-	if !p.canPair {
+	p.canPair.Store(err == nil && res == 0)
+	if !p.canPair.Load() {
 		logf("chip has no security manager (sm_configure: res=0x%x err=%v): pairing unavailable", res, err)
 		return
 	}
@@ -60,7 +60,7 @@ func (p *Proxy) initSecurity() {
 
 // secureOnConnect starts encryption on a fresh link when that can succeed without being asked.
 func (p *Proxy) secureOnConnect(c *Conn) {
-	if !p.canPair {
+	if !p.canPair.Load() {
 		return
 	}
 	p.mu.Lock()
@@ -76,7 +76,7 @@ func (p *Proxy) secureOnConnect(c *Conn) {
 
 // Pair answers Home Assistant's pair request: secure the link and report how it went.
 func (p *Proxy) Pair(addr uint64) (bool, int32) {
-	if !p.canPair {
+	if !p.canPair.Load() {
 		return false, 0x183 // not implemented
 	}
 	c := p.conn(addr)
@@ -111,13 +111,20 @@ func (p *Proxy) Pair(addr uint64) (bool, int32) {
 
 // Unpair deletes the chip's bond with addr, if it has one.
 func (p *Proxy) Unpair(addr uint64) bool {
-	if !p.canPair {
+	if !p.canPair.Load() {
 		return false
 	}
 	p.bondMu.Lock()
 	defer p.bondMu.Unlock()
-	p.bondList = make(chan Packet, 32)
-	defer func() { p.bondList = nil }()
+	bonds := make(chan Packet, 32)
+	p.mu.Lock()
+	p.bondList = bonds
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.bondList = nil
+		p.mu.Unlock()
+	}()
 	if _, res, err := p.bg.CmdResult(0x0f, 0x0b, nil); err != nil || res != 0 { // sm_list_all_bondings
 		logf("list_all_bondings: res=0x%x err=%v", res, err)
 		return false
@@ -125,7 +132,7 @@ func (p *Proxy) Unpair(addr uint64) bool {
 	ok := true
 	for {
 		select {
-		case ev := <-p.bondList:
+		case ev := <-bonds:
 			if ev.ID == 0x06 { // list_all_bondings_complete
 				return ok
 			}
@@ -144,7 +151,10 @@ func (p *Proxy) Unpair(addr uint64) bool {
 func (p *Proxy) onSecurityEvent(ev Packet) {
 	pl := ev.Payload
 	if ev.ID == 0x05 || ev.ID == 0x06 { // list_bonding_entry, list_all_bondings_complete
-		if ch := p.bondList; ch != nil {
+		p.mu.Lock()
+		ch := p.bondList
+		p.mu.Unlock()
+		if ch != nil {
 			nonBlock(ch, ev)
 		}
 		return
