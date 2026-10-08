@@ -17,6 +17,8 @@ Both are optional and independent.
 
 - Xiaomi Gateway 3 (ZNDMWG03LM, tested with firmware 1.5.0_0102) set up with the
   [Xiaomi Gateway 3 integration](https://github.com/AlexxIT/XiaomiGateway3), which opens telnet on it.
+  Only this model (`lumi.gateway.mgl03`): the integration refuses other gateways, because their
+  Bluetooth chip, reset pin and boot scripts may differ and installing could harm them.
 - For the Zigbee router: ZHA with its own coordinator, and the Xiaomi Gateway 3 integration's Zigbee
   mode set to **ZHA**. Devices paired to the gateway's own Zigbee network then need re-pairing to ZHA.
 - The gateway must reach Home Assistant on a TCP port: to install, Home Assistant serves the files from a
@@ -72,29 +74,13 @@ the Mi Home app.
 
 ### Bluetooth
 
-`gw3-btproxy` is a single static Go binary (MIPS, about 5 MB RAM) that owns the BT chip on `/dev/ttyS1`
+`gw3-btproxy` is a single static Go binary (MIPS, about 6 MB RAM) that owns the BT chip on `/dev/ttyS1`
 and speaks the ESPHome native API (plaintext) on port 6053. It supports raw advertisements, passive
 and active scanning, active connections (at most 2 at a time, a chip limit), GATT discovery, read,
 write, descriptors, notifications and indications. It does not support cache clearing or encryption,
-and it cannot pair: see below.
+and it cannot pair on this chip firmware.
 
-What I found about the chip:
-
-- Silicon Labs chip, Bluetooth SDK 2.13.8 BGAPI at 115200 baud. Commands to the chip are raw BGAPI;
-  everything from the chip is SLIP-framed. SLIP-framed commands fail with 0x0195 "command incomplete".
-- Xiaomi's firmware only forwards Xiaomi adverts in the legacy scan reports. With
-  `le_gap_set_discovery_extended_scan_response(1)` every advert comes through. The proxy sets it again
-  every time it starts scanning.
-- The firmware has no security manager: every pairing command answers 0x0183 "not implemented", so
-  the chip cannot pair, and a device that insists on pairing (an eQ-3 thermostat with its PIN on, for
-  example) hangs up on it. The proxy checks at start and offers pairing to Home Assistant only when the
-  chip can do it; it then types in the PIN listed for the device in `/data/gw3-btproxy.passkeys`
-  (lines of `MAC PIN`).
-- `system_reset(1)` puts the chip in DFU mode and it goes silent until a GPIO reset. Use `system_reset(0)`.
-- A link that drops right after opening (0x23e) works on a retry, so the proxy retries up to 3 times.
-- `/bin/daemon_miio.sh` restarts Xiaomi's `silabs_ncp_bt` and pulses the chip reset (GPIO31) every ~7 s
-  while no process with that name runs. The proxy therefore runs as `gw3-btproxy -tag silabs_ncp_bt`.
-  If the proxy dies, the daemon brings Xiaomi's app back by itself.
+Its source, build, options and what I found about the chip are in [`btproxy/`](btproxy/README.md).
 
 `gateway/gw3-btproxy.sh on|off|restore|status` switches between the two apps on the gateway; the mode is
 saved in `/data/gw3-btproxy.mode`.
@@ -136,17 +122,11 @@ In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet NCP, EZS
 ## Development
 
 ```sh
-./build.sh   # builds the proxy and bundles it into custom_components/gw3_btproxy/bin
+btproxy/build.sh   # builds the proxy and bundles it into custom_components/gw3_btproxy/bin
 ```
 
-Run the proxy on another machine against the chip through a TCP bridge on the gateway
-(`stty -F /dev/ttyS1 min 1 time 0`, then `nc -l -p 6000 </dev/ttyS1 >/dev/ttyS1`, with Xiaomi's app stopped and
-`daemon_miio.sh` paused). Switch the Bluetooth proxy off in Home Assistant first: without the boot hook, its poll
-would start the proxy on the UART in the middle of the session.
-
-```sh
-./gw3-btproxy -tcp <gateway>:6000 -listen 127.0.0.1:6053 -v
-```
+The build is reproducible, and [`btproxy/README.md`](btproxy/README.md) explains how to check the bundled
+binary against the source and how to run the proxy on another machine against the gateway's chip.
 
 `dev/` has the tools I used (all take the gateway address from `GW`):
 

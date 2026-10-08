@@ -11,7 +11,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .const import GW_DIR, GW_FILES
+from .const import GW_DIR, GW_FILES, SUPPORTED_MODELS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +21,10 @@ START, DONE = "__GW3_START__", "__GW3_DONE__"
 
 class GatewayError(Exception):
     """Telnet to the gateway failed."""
+
+
+class UnsupportedModel(GatewayError):
+    """The gateway is not a model this integration was tested on."""
 
 
 class Gateway:
@@ -83,9 +87,17 @@ class Gateway:
         return bytes(out)
 
     async def mac(self) -> str:
-        """The gateway's MAC address, used as the config entry's unique id."""
-        out = await self.run("grep ^mac= /data/miio/device.conf | cut -d= -f2")
-        return out.strip().lower()
+        """The gateway's MAC address, used as the config entry's unique id ("" when there is none)."""
+        out = (await self.run("grep ^mac= /data/miio/device.conf 2>/dev/null | cut -d= -f2")).strip().lower()
+        return out if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", out) else ""
+
+    async def model(self) -> str:
+        return (await self.run("grep ^model= /data/miio/device.conf 2>/dev/null | cut -d= -f2")).strip()
+
+    async def check_model(self) -> None:
+        model = await self.model()
+        if model not in SUPPORTED_MODELS:
+            raise UnsupportedModel(model or "unknown")
 
     async def bt_mode(self, action: str) -> bool:
         """Run gw3-btproxy.sh on|off|status; True when the proxy runs."""
@@ -113,6 +125,7 @@ class Gateway:
 
     async def install(self) -> bool:
         """Copy the bundled files to the gateway when they differ. Returns True when something changed."""
+        await self.check_model()  # never install on hardware this was not tested on
         local = await asyncio.get_running_loop().run_in_executor(None, _local_md5s)
         # chmod first: a file that was replaced but not made executable (interrupted install) is repaired here
         files = " ".join(GW_FILES)

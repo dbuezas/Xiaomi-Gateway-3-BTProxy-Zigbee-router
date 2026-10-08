@@ -11,7 +11,8 @@
     },
     "error": {
       "cannot_connect": "Cannot reach the gateway over telnet.",
-      "not_gateway": "This does not look like a Xiaomi Gateway 3."
+      "not_gateway": "This does not look like a Xiaomi Gateway 3.",
+      "unsupported_model": "This gateway is a {model}. Only the Xiaomi Gateway 3 (lumi.gateway.mgl03) is supported: other models may have different hardware, and installing could harm them."
     },
     "abort": {
       "already_configured": "This gateway is already set up."

@@ -1,6 +1,6 @@
 ref/
-/gw3-btproxy
-/gw3-btproxy-*
+/btproxy/gw3-btproxy
+/btproxy/gw3-btproxy-*
 __pycache__/
 *.pyc
 .DS_Store

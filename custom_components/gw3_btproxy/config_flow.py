@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST
 
 from .const import DOMAIN
-from .gateway import Gateway, GatewayError
+from .gateway import Gateway, GatewayError, UnsupportedModel
 
 
 class Gw3BtProxyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -18,10 +18,17 @@ class Gw3BtProxyConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
+        placeholders = {"model": ""}
         if user_input is not None:
             host = user_input[CONF_HOST].strip()
             try:
-                mac = await Gateway(host).mac()
+                gateway = Gateway(host)
+                mac = await gateway.mac()
+                if mac:
+                    await gateway.check_model()
+            except UnsupportedModel as err:
+                errors["base"] = "unsupported_model"
+                placeholders["model"] = str(err)
             except GatewayError:
                 errors["base"] = "cannot_connect"
             else:
@@ -35,6 +42,7 @@ class Gw3BtProxyConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=vol.Schema({vol.Required(CONF_HOST, default=self._suggested_host()): str}),
             errors=errors,
+            description_placeholders=placeholders,
         )
 
     def _suggested_host(self) -> str:
