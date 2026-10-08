@@ -138,13 +138,17 @@ class Gateway:
                     except GatewayError:
                         pass
                     raise GatewayError(f"download of {name} failed: {out!r}")
-        was_on = "gw3-btproxy" in stale and await self.bt_mode("status")
-        if was_on:  # the running binary is replaced; daemon_miio.sh starts Xiaomi's app meanwhile
-            await self.run(f"kill $(ps -ww | grep '{GW_DIR}/gw3-btproxy -tag' | grep -v grep | awk '{{print $1}}')")
-        await self.run(" && ".join(f"mv {GW_DIR}/{n}.new {GW_DIR}/{n}" for n in stale))  # already executable
-        if was_on:
-            await asyncio.sleep(8)
-            await self.bt_mode("on")
+        mv = " && ".join(f"mv {GW_DIR}/{n}.new {GW_DIR}/{n}" for n in stale)  # already executable
+        if "gw3-btproxy" in stale and await self.bt_mode("status"):
+            # The running proxy is replaced: stop it, move the files in, start the new one. One detached command
+            # on the gateway, so it completes even if this telnet session or Home Assistant goes away meanwhile.
+            # daemon_miio.sh runs Xiaomi's app in between; restore waits for that and starts the proxy (mode proxy).
+            await self.run(
+                f"(trap '' HUP; kill $(ps -ww | grep '{GW_DIR}/gw3-btproxy -tag' | grep -v grep | awk '{{print $1}}'); "
+                f"sleep 2; {mv} && sh {GW_DIR}/gw3-btproxy.sh restore) </dev/null >/dev/null 2>&1 &"
+            )
+        else:
+            await self.run(mv)
         return True
 
 

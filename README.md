@@ -19,6 +19,9 @@ Both are optional and independent.
   [Xiaomi Gateway 3 integration](https://github.com/AlexxIT/XiaomiGateway3), which opens telnet on it.
 - For the Zigbee router: ZHA with its own coordinator, and the Xiaomi Gateway 3 integration's Zigbee
   mode set to **ZHA**. Devices paired to the gateway's own Zigbee network then need re-pairing to ZHA.
+- The gateway must reach Home Assistant on a TCP port: to install, Home Assistant serves the files from a
+  short-lived HTTP server on a random port and the gateway downloads them. Fine for Home Assistant OS and host
+  networking; with Docker bridge networking or a host firewall, the install keeps failing ("download ... failed").
 
 ## Install
 
@@ -54,6 +57,9 @@ folder: the backups hold the network key (the files are readable by their owner 
 Safety checks: the switch refuses when ZHA uses this chip as its own radio, and does nothing when it is already
 off. If the chip joined ZHA with version 0.2.x, there is no backup: switching off then leaves it with no network
 (a notification says so), and its devices must be paired again in Mi Home.
+
+Before removing the integration, switch the Zigbee router off: otherwise the chip stays a ZHA router that nothing
+brings back after the next gateway reboot.
 
 ### Xiaomi Bluetooth sensors
 
@@ -106,7 +112,9 @@ normally, so install it carefully:
 
 0. Check first: `grep -n scripts /etc/init.d/rcS` shows the `CUSTOM_STARTUP=/data/scripts/startup.sh` line, and
    `/data/scripts/startup.sh` does not exist yet (if it does, merge the `restore` line into it instead).
-1. Write it as `/data/scripts/startup.sh.new` (not executable yet; `mkdir -p /data/scripts` first).
+1. Write it as `/data/scripts/startup.sh.new` (not executable yet; `mkdir -p /data/scripts` first). The gateway
+   has no scp: serve the file from your computer (`python3 -m http.server` in `gateway/`) and run
+   `wget -O /data/scripts/startup.sh.new http://<your computer>:8000/startup.sh` on the gateway.
 2. Check it on the gateway: `sh -n`, the checksum matches this file, the first line is `#!/bin/sh`, no
    CR line endings.
 3. Only then: `chmod 755 /data/scripts/startup.sh.new && mv /data/scripts/startup.sh.new /data/scripts/startup.sh`.
@@ -132,7 +140,9 @@ In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet NCP, EZS
 ```
 
 Run the proxy on another machine against the chip through a TCP bridge on the gateway
-(`nc -l -p 6000 </dev/ttyS1 >/dev/ttyS1`, with Xiaomi's app stopped and `daemon_miio.sh` paused):
+(`stty -F /dev/ttyS1 min 1 time 0`, then `nc -l -p 6000 </dev/ttyS1 >/dev/ttyS1`, with Xiaomi's app stopped and
+`daemon_miio.sh` paused). Switch the Bluetooth proxy off in Home Assistant first: without the boot hook, its poll
+would start the proxy on the UART in the middle of the session.
 
 ```sh
 ./gw3-btproxy -tcp <gateway>:6000 -listen 127.0.0.1:6053 -v

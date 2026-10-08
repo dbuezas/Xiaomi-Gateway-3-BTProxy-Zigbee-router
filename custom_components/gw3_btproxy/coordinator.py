@@ -32,6 +32,12 @@ PERMIT_SECONDS = 120
 RETRY_MAX = 3600  # failed router restores are retried after 4, 8, 16 ... minutes, at most every hour
 
 
+def _reason(err: BaseException) -> str:
+    if isinstance(err, TimeoutError):
+        return "the Zigbee chip did not answer in time"
+    return repr(err)
+
+
 class GatewayCoordinator(DataUpdateCoordinator[dict]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, gateway: Gateway) -> None:
         super().__init__(
@@ -137,7 +143,10 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
         """The chip holds ZHA's own network as coordinator (it once was ZHA's radio). The probe has just brought
         that duplicate coordinator up: reset it at once, then refuse."""
         if net and chip.network and zigbee.same_network(chip.network, net) and chip.node_type != "ROUTER":
-            await asyncio.wait_for(zigbee.reset(self.gateway.host), CHIP_TIMEOUT)
+            try:
+                await asyncio.wait_for(zigbee.reset(self.gateway.host), CHIP_TIMEOUT)
+            except Exception as err:  # noqa: BLE001  the refusal below is what matters
+                _LOGGER.warning("Could not reset the chip: %r", err)
             raise HomeAssistantError(
                 f"The chip holds the ZHA network as {chip.node_type} (a copy of ZHA's own network); it was reset, "
                 "nothing else changed"
@@ -199,9 +208,11 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
                 except Exception as rerr:  # noqa: BLE001
                     _LOGGER.error("Joining failed and restoring %s failed too: %r", saved, rerr)
             if not joined:
+                if self.router_option:
+                    self._router_state = ROUTER_ERROR  # the chip was touched: "up" is no longer known
                 if isinstance(err, (HomeAssistantError, asyncio.CancelledError)):
                     raise
-                raise HomeAssistantError(f"Turning the Zigbee router on failed: {err!r}") from err
+                raise HomeAssistantError(f"Turning the Zigbee router on failed: {_reason(err)}") from err
             _LOGGER.warning("The join reported %r but the chip is a router in the ZHA network: keeping it", err)
         # joined (or already a router): from here on, failures are only warnings
         self._router_fails, self._router_left, self._router_state = 0, False, ROUTER_UP
@@ -249,13 +260,15 @@ class GatewayCoordinator(DataUpdateCoordinator[dict]):
                 )
             else:
                 message = (
-                    "The gateway's Zigbee chip left the ZHA network. There is no backup of its own network "
-                    "(it joined ZHA with an older version), so it has no network now: pair its devices again in Mi Home."
+                    "The gateway's Zigbee chip left the ZHA network. There is no backup of its own network (it had "
+                    "none when it first joined, or joined with version 0.2.x), so it has no network now: pair its "
+                    "devices again in Mi Home."
                 )
-        except HomeAssistantError:
-            raise
         except Exception as err:  # noqa: BLE001
-            raise HomeAssistantError(f"Turning the Zigbee router off failed: {err!r}. Try again.") from err
+            self._router_state = ROUTER_ERROR  # the chip was touched: "up" is no longer known
+            if isinstance(err, HomeAssistantError):
+                raise
+            raise HomeAssistantError(f"Turning the Zigbee router off failed: {_reason(err)}. Try again.") from err
         persistent_notification.async_create(hass, message, title="Gateway Zigbee router off", notification_id="gw3_btproxy_zigbee_off")
         self._router_left, self._router_fails, self._router_state = False, 0, ROUTER_OFF
         self._set_option(False)

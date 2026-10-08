@@ -251,7 +251,7 @@ func (p *Proxy) onEvent(ev Packet) {
 			// the chip rebooted by itself: every link is gone and it no longer scans. Let the watchdog set it up again.
 			logf("chip rebooted unexpectedly")
 			p.needInit.Store(true)
-			p.dropAll(0x13e)
+			p.dropAll(0x23e)
 			return
 		}
 		select {
@@ -399,8 +399,8 @@ func (p *Proxy) advLoop() {
 // watchdog restarts scanning (or the whole chip) when adverts stop arriving.
 func (p *Proxy) watchdog() {
 	for range time.Tick(15 * time.Second) {
-		if p.connecting.Load() {
-			continue // scanning is paused while a link is set up (up to a minute for a large device)
+		if p.connecting.Load() || p.initing.Load() {
+			continue // scanning is paused while a link is set up (up to a minute), or Init is still running
 		}
 		p.mu.Lock()
 		quiet := time.Since(p.lastAdv)
@@ -413,9 +413,9 @@ func (p *Proxy) watchdog() {
 		} else {
 			logf("no adverts for %v, restarting chip", quiet.Round(time.Second))
 		}
-		p.dropAll(0x13e)   // as "connection failed to be established"
+		p.dropAll(0x23e)   // as "connection failed to be established"
 		p.connectMu.Lock() // no le_gap_connect may go out while the chip resets
-		p.dropAll(0x13e)   // a connect that slipped in before the lock was taken
+		p.dropAll(0x23e)   // a connect that slipped in before the lock was taken
 		err := p.Init()
 		p.connectMu.Unlock()
 		if err != nil {

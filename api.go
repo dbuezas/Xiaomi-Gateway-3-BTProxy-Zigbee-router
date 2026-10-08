@@ -463,7 +463,17 @@ func (s *Server) broadcastScannerState() {
 	}
 }
 
+// The chip reports ATT errors as 0x04xx and HCI errors as 0x02xx; ESPHome clients (aioesphomeapi's
+// ESPHOME_GATT_ERRORS, BLEConnectionError) expect the bare ATT / HCI code.
+func espCode(code int32) int32 {
+	if code >= 0x200 && code < 0x500 && code&0xff00 != 0x300 {
+		return code & 0xff
+	}
+	return code
+}
+
 func (s *Server) gattError(addr uint64, handle uint16, res int32) {
+	res = espCode(res)
 	var w pb
 	w.Uint(1, addr)
 	w.Uint(2, uint64(handle))
@@ -550,6 +560,7 @@ func (s *Server) Adverts(advs []RawAdv) {
 }
 
 func (s *Server) DeviceConnection(addr uint64, connected bool, mtu uint16, errCode int32) {
+	errCode = espCode(errCode)
 	var w pb
 	w.Uint(1, addr)
 	w.Bool(2, connected)

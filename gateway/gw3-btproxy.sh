@@ -44,8 +44,8 @@ lock() { # $1: seconds to wait
 				# daemon right here: another run may take the freed lock first, and it knows nothing of the pause.
 				GC=1
 				if [ "$(readlink $LOCK 2>/dev/null)" = "$H" ]; then
+					for d in $(daemon_pid); do kill -CONT $d 2>/dev/null; done # before freeing the lock
 					rm -f $LOCK
-					for d in $(daemon_pid); do kill -CONT $d 2>/dev/null; done
 				fi
 				GC=
 				rm -r $LOCK.gc
@@ -125,14 +125,16 @@ on | off | restore | status) ;;
 	;;
 esac
 
-# the boot restore can hold the lock ~2 min (waits for the daemon, then up to 3 tries); status never waits
-WAIT=150
+# the boot restore holds the lock up to ~2 min (waits for the daemon, then up to 3 tries); status never waits.
+# 120 s of waiting plus our own 3 tries stays under Home Assistant's 240 s.
+WAIT=120
 [ "$1" = status ] && WAIT=0
 if lock $WAIT; then
 	case "$1" in
 	on)
 		set_mode proxy || { echo "cannot save the mode (is /data full?)" >&2; exit 1; }
-		start
+		# did not stay up: back to Xiaomi mode, so nothing keeps retrying while the switch shows off
+		start || set_mode xiaomi
 		;;
 	off)
 		set_mode xiaomi || { echo "cannot save the mode (is /data full?)" >&2; exit 1; }
