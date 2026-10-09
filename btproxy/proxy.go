@@ -123,6 +123,9 @@ func (p *Proxy) Init() error {
 		logf("chip does not answer hello, pulsing reset GPIO")
 		gpioReset()
 	}
+	// A reset just before this one (the switch script's, or the GPIO pulse above) may still deliver its boot event:
+	// let it arrive and drop it, so it is not taken for the boot event of the reset below.
+	time.Sleep(300 * time.Millisecond)
 	for len(p.bootCh) > 0 {
 		<-p.bootCh
 	}
@@ -219,16 +222,27 @@ func (p *Proxy) SetActive(active bool) {
 	}
 }
 
-// gpioReset pulses the chip reset line, the same way daemon_miio.sh does.
+// gpioReset pulses the chip reset line (GPIO31), the way daemon_miio.sh (firmware 1.5.0) and
+// reset_bt_target.sh 1 (1.5.4 and later) do. On 1.5.4+ GPIO37 selects the chip's bootloader when it is low
+// during the reset: it is set high first, so the chip always starts its application, never the bootloader.
+// Only there: 1.5.0 uses GPIO26 for that pin (in its own flash scripts) and never touches GPIO37.
 func gpioReset() {
 	const v = "/sys/class/gpio/gpio31/value"
 	if _, err := os.Stat(v); err != nil {
 		return
 	}
+	if boot := "/sys/class/gpio/gpio37/value"; fileExists("/bin/reset_bt_target.sh") && fileExists(boot) {
+		os.WriteFile(boot, []byte("1"), 0)
+	}
 	os.WriteFile(v, []byte("0"), 0)
 	time.Sleep(time.Second)
 	os.WriteFile(v, []byte("1"), 0)
 	time.Sleep(time.Second)
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // ---------- event loop ----------
@@ -247,6 +261,9 @@ func (p *Proxy) onEvent(ev Packet) {
 	pl := ev.Payload
 	switch {
 	case ev.Class == 0x01 && ev.ID == 0x00: // system_boot
+		if r, ok := p.bg.w.(interface{ Rearm() }); ok {
+			r.Rearm() // hardware flow control after the reset: before anything else is sent
+		}
 		if !p.initing.Load() {
 			// the chip rebooted by itself: every link is gone and it no longer scans. Let the watchdog set it up again.
 			logf("chip rebooted unexpectedly")

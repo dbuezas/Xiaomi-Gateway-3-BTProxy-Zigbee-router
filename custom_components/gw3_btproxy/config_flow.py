@@ -9,8 +9,8 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST
 
-from .const import DOMAIN
-from .gateway import Gateway, GatewayError, UnsupportedModel
+from .const import DOMAIN, SUPPORTED_FIRMWARES
+from .gateway import Gateway, GatewayError, UnsupportedFirmware, UnsupportedModel
 
 
 class Gw3BtProxyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -18,7 +18,7 @@ class Gw3BtProxyConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
-        placeholders = {"model": ""}
+        placeholders = {"model": "", "version": "", "tested": ", ".join(SUPPORTED_FIRMWARES)}
         if user_input is not None:
             host = user_input[CONF_HOST].strip()
             try:
@@ -26,6 +26,9 @@ class Gw3BtProxyConfigFlow(ConfigFlow, domain=DOMAIN):
                 mac = await gateway.mac()
                 if mac:
                     await gateway.check_model()
+            except UnsupportedFirmware as err:
+                errors["base"] = "unsupported_firmware"
+                placeholders["version"] = str(err)
             except UnsupportedModel as err:
                 errors["base"] = "unsupported_model"
                 placeholders["model"] = str(err)

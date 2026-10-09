@@ -54,13 +54,16 @@ The version reported to Home Assistant comes from the integration's `manifest.js
 | `-max-conn` | `2` | simultaneous connections (the chip allows 2) |
 | `-active` | off | active scanning (Home Assistant can also switch it) |
 | `-mtu` | `247` | largest ATT MTU to offer (23 = never exchange) |
+| `-rtscts` | off | hardware flow control on the UART (`gw3-btproxy.sh` sets it on 1.5.4+) |
 | `-passkeys` | `/data/gw3-btproxy.passkeys` | `MAC PIN` lines, for pairing |
 | `-tag` | | ignored; `-tag silabs_ncp_bt` makes `daemon_miio.sh` treat the proxy as its BT app |
 | `-v` | off | debug logging |
 
 ## What I found about the chip
 
-- Silicon Labs chip, Bluetooth SDK 2.13.8 BGAPI at 115200 baud. Commands to the chip are raw BGAPI;
+- Silicon Labs chip, BGAPI at 115200 baud: Bluetooth stack 2.13.8 with gateway firmware 1.5.0_0102 (chip
+  firmware 1.3.0), 2.13.10 with 1.5.4_0090 (chip firmware 1.4.0; the gateway update flashes the chip too). Same
+  command set on both. Commands to the chip are raw BGAPI;
   everything from the chip is SLIP-framed. SLIP-framed commands fail with 0x0195 "command incomplete".
 - Xiaomi's firmware only forwards Xiaomi adverts in the legacy scan reports. With
   `le_gap_set_discovery_extended_scan_response(1)` every advert comes through. The proxy sets it again
@@ -72,14 +75,26 @@ The version reported to Home Assistant comes from the integration's `manifest.js
 - `system_reset(1)` puts the chip in DFU mode and it goes silent until a GPIO reset. Use `system_reset(0)`.
 - A link that drops right after opening (0x23e) works on a retry, so the proxy retries up to 3 times.
 - The chip reports errors as 0x02xx (HCI) and 0x04xx (ATT); the proxy passes the bare codes on, as ESPHome does.
-- `/bin/daemon_miio.sh` restarts Xiaomi's `silabs_ncp_bt` and pulses the chip reset (GPIO31) every ~7 s
-  while no process with that name runs. The proxy therefore runs as `gw3-btproxy -tag silabs_ncp_bt`.
+- Hardware flow control (RTS/CTS) on 1.5.4+, as Xiaomi's own app uses there (on 1.5.0 neither uses it; the
+  Zigbee chip's UART has no CTS line at all). Without it the gateway drops received bytes now and then (the
+  kernel's overrun counter, `oe:` in `/proc/tty/driver/serial`, reached 197 in a few hours). With it: none in my
+  tests. One trap: this kernel's UART driver stops sending for good when CTS drops, which the chip does for ~130 ms
+  after every reset, and never notices CTS coming back. So the proxy switches flow control on only once CTS is up,
+  waits for CTS before every write, and after every chip boot event turns flow control off and on again, which
+  clears the driver's pause.
+- Up to 1.5.3, `/bin/daemon_miio.sh` restarts Xiaomi's `silabs_ncp_bt` and pulses the chip reset (GPIO31) every
+  ~7 s while no process with that name runs. The proxy therefore runs as `gw3-btproxy -tag silabs_ncp_bt`.
   If the proxy dies, the daemon brings Xiaomi's app back by itself.
+- From 1.5.4 on, `/bin/app_monitor.sh` does that every 5 s, unless `/tmp/bt_dont_need_startup` exists, and
+  `reset_bt_target.sh` resets the chip: GPIO31 is the reset, and GPIO37 must be high, or the chip starts its
+  bootloader. (1.5.0 names that pin GPIO26 in its flash scripts.) The proxy sets GPIO37 high before it pulses the
+  reset, on 1.5.4+ only.
 
 ## Run it on another machine
 
 Against the chip through a TCP bridge on the gateway: `stty -F /dev/ttyS1 min 1 time 0`, then
-`nc -l -p 6000 </dev/ttyS1 >/dev/ttyS1`, with Xiaomi's app stopped and `daemon_miio.sh` paused. Switch the
+`nc -l -p 6000 </dev/ttyS1 >/dev/ttyS1`, with Xiaomi's app stopped and `daemon_miio.sh` paused (1.5.4+: `touch
+/tmp/bt_dont_need_startup` instead of pausing). Switch the
 Bluetooth proxy off in Home Assistant first: without the boot hook, its poll would start the proxy on the UART in
 the middle of the session.
 

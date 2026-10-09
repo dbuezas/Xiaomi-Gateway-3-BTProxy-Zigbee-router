@@ -148,6 +148,10 @@ func (b *BGAPI) Cmd(class, id byte, payload []byte, timeout time.Duration) ([]by
 			}
 			debugf("bgapi: stray %v", p)
 		case <-t.C:
+			// with hardware flow control, sending may be paused although the chip did not reset: clear it
+			if r, ok := b.w.(interface{ Unstick() }); ok {
+				r.Unstick()
+			}
 			return nil, fmt.Errorf("cmd %d.%d: %w", class, id, ErrTimeout)
 		}
 	}

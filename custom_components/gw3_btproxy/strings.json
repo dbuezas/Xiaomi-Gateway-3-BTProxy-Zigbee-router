@@ -12,7 +12,8 @@
     "error": {
       "cannot_connect": "Cannot reach the gateway over telnet.",
       "not_gateway": "This does not look like a Xiaomi Gateway 3.",
-      "unsupported_model": "This gateway is a {model}. Only the Xiaomi Gateway 3 (lumi.gateway.mgl03) is supported: other models may have different hardware, and installing could harm them."
+      "unsupported_model": "This gateway is a {model}. Only the Xiaomi Gateway 3 (lumi.gateway.mgl03) is supported: other models may have different hardware, and installing could harm them.",
+      "unsupported_firmware": "The gateway runs firmware {version}, which this integration has not been tested on. Tested: {tested} (each firmware changes how the Bluetooth chip is handled)."
     },
     "abort": {
       "already_configured": "This gateway is already set up."

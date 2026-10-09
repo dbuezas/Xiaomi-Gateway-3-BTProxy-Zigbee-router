@@ -29,6 +29,7 @@ func debugf(format string, a ...any) {
 func main() {
 	serialPath := flag.String("serial", "/dev/ttyS1", "BT chip UART")
 	tcpAddr := flag.String("tcp", "", "use a TCP bridge to the UART instead (host:port), for development")
+	rtscts := flag.Bool("rtscts", false, "hardware flow control on the UART (RTS/CTS), switched on once the chip raises CTS")
 	listen := flag.String("listen", ":6053", "ESPHome API listen address")
 	name := flag.String("name", "gw3-btproxy", "device name (hostname style)")
 	friendly := flag.String("friendly-name", "Gateway BT Proxy", "friendly name")
@@ -50,7 +51,7 @@ func main() {
 	if *tcpAddr != "" {
 		port, err = net.DialTimeout("tcp", *tcpAddr, 5*time.Second)
 	} else {
-		port, err = openSerial(*serialPath)
+		port, err = openSerial(*serialPath, *rtscts)
 	}
 	if err != nil {
 		log.Fatalf("open chip port: %v", err)

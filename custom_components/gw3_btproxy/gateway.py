@@ -11,7 +11,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from .const import GW_DIR, GW_FILES, SUPPORTED_MODELS
+from .const import GW_DIR, GW_FILES, SUPPORTED_FIRMWARES, SUPPORTED_MODELS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +25,10 @@ class GatewayError(Exception):
 
 class UnsupportedModel(GatewayError):
     """The gateway is not a model this integration was tested on."""
+
+
+class UnsupportedFirmware(UnsupportedModel):
+    """The gateway runs a firmware this integration was not tested on."""
 
 
 class Gateway:
@@ -94,17 +98,24 @@ class Gateway:
     async def model(self) -> str:
         return (await self.run("grep ^model= /data/miio/device.conf 2>/dev/null | cut -d= -f2")).strip()
 
+    async def firmware(self) -> str:
+        return (await self.run("grep ^version= /etc/rootfs_fw_info 2>/dev/null | cut -d= -f2")).strip()
+
     async def check_model(self) -> None:
+        """Raise unless the model and its firmware were tested (UnsupportedFirmware for the firmware)."""
         model = await self.model()
         if model not in SUPPORTED_MODELS:
             raise UnsupportedModel(model or "unknown")
+        firmware = await self.firmware()
+        if firmware not in SUPPORTED_FIRMWARES:
+            raise UnsupportedFirmware(firmware or "unknown")
 
     async def bt_mode(self, action: str) -> bool:
         """Run gw3-btproxy.sh on|off|status; True when the proxy runs."""
-        # a switch can wait up to 150 s for the lock (boot restore) and then needs up to 3 tries
-        out = await self.run(f"sh {GW_DIR}/gw3-btproxy.sh {action}", timeout=240)
+        # a switch can wait up to 90 s for the lock (boot restore) and then needs up to 3 tries
+        out = await self.run(f"sh {GW_DIR}/gw3-btproxy.sh {action}", timeout=270)
         lines = out.strip().splitlines()
-        if any(line.startswith(("busy:", "cannot save")) for line in lines):
+        if any(line.startswith(("busy:", "cannot save", "unsupported firmware")) for line in lines):
             raise GatewayError(f"gw3-btproxy.sh {action}: {lines[-1]}")
         return lines[-1:] == ["on"]
 
@@ -153,13 +164,11 @@ class Gateway:
                     raise GatewayError(f"download of {name} failed: {out!r}")
         mv = " && ".join(f"mv {GW_DIR}/{n}.new {GW_DIR}/{n}" for n in stale)  # already executable
         if "gw3-btproxy" in stale and await self.bt_mode("status"):
-            # The running proxy is replaced: stop it, move the files in, start the new one. One detached command
-            # on the gateway, so it completes even if this telnet session or Home Assistant goes away meanwhile.
-            # daemon_miio.sh runs Xiaomi's app in between; restore waits for that and starts the proxy (mode proxy).
-            await self.run(
-                f"(trap '' HUP; kill $(ps -ww | grep '{GW_DIR}/gw3-btproxy -tag' | grep -v grep | awk '{{print $1}}'); "
-                f"sleep 2; {mv} && sh {GW_DIR}/gw3-btproxy.sh restore) </dev/null >/dev/null 2>&1 &"
-            )
+            # The running proxy is replaced: move the files in (it keeps running from the old one), then restart it
+            # under the script's lock. One detached command on the gateway, so it completes even if this telnet
+            # session or Home Assistant goes away meanwhile.
+            # In braces: run() appends "; echo DONE", and "&;" is a syntax error.
+            await self.run(f"{{ (trap '' HUP; {mv} && sh {GW_DIR}/gw3-btproxy.sh restart) </dev/null >/dev/null 2>&1 & }}")
         else:
             await self.run(mv)
         return True

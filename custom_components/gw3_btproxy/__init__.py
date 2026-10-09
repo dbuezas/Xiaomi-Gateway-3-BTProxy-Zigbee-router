@@ -11,9 +11,9 @@ from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 
-from .const import DOMAIN, SUPPORTED_MODELS
+from .const import DOMAIN, SUPPORTED_FIRMWARES, SUPPORTED_MODELS
 from .coordinator import GatewayCoordinator
-from .gateway import Gateway, GatewayError, UnsupportedModel
+from .gateway import Gateway, GatewayError, UnsupportedFirmware, UnsupportedModel
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,7 +27,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: GatewayConfigEntry) -> b
     try:
         if await gateway.install():
             _LOGGER.info("Installed gw3-btproxy on %s", gateway.host)
-    except UnsupportedModel as err:  # no retries: it will not become supported
+    except UnsupportedFirmware as err:  # no retries: it will not become supported
+        raise ConfigEntryError(
+            f"Gateway firmware {err} is not supported (tested: {', '.join(SUPPORTED_FIRMWARES)})"
+        ) from err
+    except UnsupportedModel as err:
         raise ConfigEntryError(f"Gateway model {err} is not supported (only {', '.join(SUPPORTED_MODELS)})") from err
     except GatewayError as err:
         raise ConfigEntryNotReady(str(err)) from err
