@@ -9,12 +9,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// openSerial opens the chip UART raw at 115200 8N1, blocking reads. With rtscts it also turns on hardware flow
-// control (RTS/CTS). This kernel's UART driver stops sending for good when it gets data to send while CTS is low
+// openSerial opens the chip UART raw at 115200 8N1, blocking reads, with hardware flow control (RTS/CTS), as
+// Xiaomi's app uses it. This kernel's UART driver stops sending for good when it gets data to send while CTS is low
 // (the chip holds CTS low for ~130 ms after every reset, a little longer than its boot event), and never notices
 // CTS coming back. So flow control goes on only once the chip raises CTS, and every write first waits for CTS.
 // If CTS stays low, the port runs without flow control.
-func openSerial(path string, rtscts bool) (io.ReadWriter, error) {
+func openSerial(path string) (io.ReadWriter, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
 		return nil, err
@@ -35,9 +35,6 @@ func openSerial(path string, rtscts bool) (io.ReadWriter, error) {
 	if err := unix.IoctlSetTermios(fd, unix.TCSETS, t); err != nil {
 		f.Close()
 		return nil, err
-	}
-	if !rtscts {
-		return f, nil
 	}
 	p := &ctsPort{File: f, fd: fd}
 	if waitCTS(fd, 3*time.Second) {

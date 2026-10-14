@@ -91,18 +91,17 @@ brings back after the next gateway reboot.
 ### Firmwares
 
 Each one tested on my gateway: switching both ways, a proxy crash (Xiaomi's app comes back), a reboot with the
-boot hook, the API test (adverts, connect, GATT read, write, notify), cancelling a pending connect, the Zigbee router
-(on 1.5.0_0026 only on the gateway side: its scripts are identical to 1.5.0_0102's). The Zigbee router's host on the
-gateway (version 0.5.0) is tested on 1.5.4_0090 only.
+boot hook, the API test (adverts, connect, GATT read, write, notify), cancelling a pending connect, the Zigbee
+router. The Zigbee router's host on the gateway is tested on 1.5.4_0090 only.
 
 | Firmware | Bluetooth chip | Hardware flow control | Lost bytes in 3 min |
 | --- | --- | --- | --- |
-| 1.5.0_0026, 1.5.0_0102, 1.5.1_0032 | 1.3.0 | not available (the chip does not drive CTS) | ~3 to 200 |
 | 1.5.4_0090, 1.5.7_0001 | 1.4.0 | yes | 0 |
 
-So 1.5.4 or newer works best. Updating the gateway firmware also flashes the Bluetooth chip. Not supported:
-1.4.x (different boot scripts) and 1.5.5, 1.5.6 (I could not get them to test). AlexxIT's integration lists 1.5.7
-as untested; on my gateway it worked, including Zigbee in ZHA mode.
+Updating the gateway firmware also flashes the Bluetooth chip. Not supported: everything before 1.5.4 (another
+watchdog and chip reset, and no hardware flow control: the gateway loses Bluetooth bytes; version 0.5.0 of this
+integration still supports 1.5.0_0026, 1.5.0_0102 and 1.5.1_0032), and 1.5.5, 1.5.6 (I could not get them to
+test). AlexxIT's integration lists 1.5.7 as untested; on my gateway it worked, including Zigbee in ZHA mode.
 
 On a firmware that is not in the list (also after a firmware update), the integration does not load, so its
 switches are gone, and the script does not start the proxy (Xiaomi's app keeps the Bluetooth chip). So before

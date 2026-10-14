@@ -222,27 +222,18 @@ func (p *Proxy) SetActive(active bool) {
 	}
 }
 
-// gpioReset pulses the chip reset line (GPIO31), the way daemon_miio.sh (firmware 1.5.0) and
-// reset_bt_target.sh 1 (1.5.4 and later) do. On 1.5.4+ GPIO37 selects the chip's bootloader when it is low
-// during the reset: it is set high first, so the chip always starts its application, never the bootloader.
-// Only there: 1.5.0 uses GPIO26 for that pin (in its own flash scripts) and never touches GPIO37.
+// gpioReset pulses the chip reset line (GPIO31), the way reset_bt_target.sh 1 does. GPIO37 selects the chip's
+// bootloader when it is low during the reset: it is set high first, so the chip always starts its application.
 func gpioReset() {
 	const v = "/sys/class/gpio/gpio31/value"
 	if _, err := os.Stat(v); err != nil {
 		return
 	}
-	if boot := "/sys/class/gpio/gpio37/value"; fileExists("/bin/reset_bt_target.sh") && fileExists(boot) {
-		os.WriteFile(boot, []byte("1"), 0)
-	}
+	os.WriteFile("/sys/class/gpio/gpio37/value", []byte("1"), 0)
 	os.WriteFile(v, []byte("0"), 0)
 	time.Sleep(time.Second)
 	os.WriteFile(v, []byte("1"), 0)
 	time.Sleep(time.Second)
-}
-
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
 }
 
 // ---------- event loop ----------

@@ -34,7 +34,6 @@ func main() {
 	}
 	serialPath := flag.String("serial", "/dev/ttyS1", "BT chip UART")
 	tcpAddr := flag.String("tcp", "", "use a TCP bridge to the UART instead (host:port), for development")
-	rtscts := flag.Bool("rtscts", false, "hardware flow control on the UART (RTS/CTS), switched on once the chip raises CTS")
 	listen := flag.String("listen", ":6053", "ESPHome API listen address")
 	name := flag.String("name", "gw3-btproxy", "device name (hostname style)")
 	friendly := flag.String("friendly-name", "Gateway BT Proxy", "friendly name")
@@ -43,7 +42,6 @@ func main() {
 	active := flag.Bool("active", false, "active scanning")
 	maxMTU := flag.Uint("mtu", 247, "largest ATT MTU to offer (23 = never exchange)")
 	flag.StringVar(&passkeyFile, "passkeys", passkeyFile, "file of 'MAC PIN' lines: the PIN to type in when a device asks for one")
-	flag.String("tag", "", "ignored; '-tag silabs_ncp_bt' makes daemon_miio.sh treat this process as its BT app")
 	flag.BoolVar(&verbose, "v", false, "debug logging")
 	flag.Parse()
 
@@ -56,7 +54,7 @@ func main() {
 	if *tcpAddr != "" {
 		port, err = net.DialTimeout("tcp", *tcpAddr, 5*time.Second)
 	} else {
-		port, err = openSerial(*serialPath, *rtscts)
+		port, err = openSerial(*serialPath)
 	}
 	if err != nil {
 		log.Fatalf("open chip port: %v", err)
