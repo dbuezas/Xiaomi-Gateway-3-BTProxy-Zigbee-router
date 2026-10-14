@@ -19,4 +19,5 @@ fi
 mkdir -p ../custom_components/gw3_btproxy/bin
 cp gw3-btproxy-mipsle ../custom_components/gw3_btproxy/bin/gw3-btproxy
 cp ../gateway/gw3-btproxy.sh ../custom_components/gw3_btproxy/bin/gw3-btproxy.sh
+cp ../gateway/gw3-zigbee.sh ../custom_components/gw3_btproxy/bin/gw3-zigbee.sh
 ls -la ../custom_components/gw3_btproxy/bin

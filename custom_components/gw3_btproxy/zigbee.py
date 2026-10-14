@@ -56,6 +56,40 @@ async def zha_network(hass: HomeAssistant) -> Network:
     return await hass.async_add_executor_job(_zha_network_from_backup, hass.config.path("zigbee.db"))
 
 
+HOST_MODEL = "Gateway 3 Zigbee router"  # the model the router host's Basic cluster reports (btproxy/zigbee.go)
+
+
+def _knows_host(device) -> bool:
+    """ZHA has read the host's current endpoints: the LED with colour on 1, the button on 2 (btproxy/zigbee.go)."""
+    led, button = device.endpoints.get(1), device.endpoints.get(2)
+    return device.model == HOST_MODEL and led is not None and 0x0300 in led.in_clusters and button is not None
+
+
+def host_args(net: Network) -> str:
+    """gw3-zigbee.sh start arguments: the network the host must find the chip routing for."""
+    return f"{net.extended_pan_id} {net.pan_id} {net.channel}"
+
+
+def zha_reinterview(hass: HomeAssistant, ieee: str) -> bool:
+    """Let ZHA read the router again when it does not know the host's endpoints yet (it met the router before the
+    host had them, or an older host's; the same as the Reconfigure button). False when ZHA could not be asked (try
+    again later)."""
+    try:
+        import zigpy.types
+        from homeassistant.components.zha.helpers import get_zha_gateway
+
+        gateway = get_zha_gateway(hass)
+        key = zigpy.types.EUI64.convert(ieee)
+        device = gateway.application_controller.devices.get(key)
+        if device is not None and not _knows_host(device):
+            _LOGGER.info("Asking ZHA to read the gateway's Zigbee router (%s) again", ieee)
+            hass.async_create_task(gateway.async_reinterview_device(key))
+        return True
+    except Exception as err:  # noqa: BLE001  ZHA internals change between releases
+        _LOGGER.debug("Could not ask ZHA to read the router again (%r); its Reconfigure button does it", err)
+        return False
+
+
 def _zha_network_from_backup(path: str) -> Network:
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
@@ -83,6 +117,10 @@ async def _configure(ezsp) -> None:
         (status,) = await ezsp.setConfigurationValue(cid, val)
         if status != t.EzspStatus.SUCCESS:
             raise ZigbeeError(f"setConfigurationValue {cid.name}: {status}")
+    # packet buffers last, as bellows does: with the chip's default, the messages it sends are garbled
+    (status,) = await ezsp.setConfigurationValue(t.EzspConfigId.CONFIG_PACKET_BUFFER_COUNT, 0xFF)
+    if status != t.EzspStatus.SUCCESS:
+        _LOGGER.warning("setConfigurationValue CONFIG_PACKET_BUFFER_COUNT: %s", status)
 
 
 async def _wait_up(ezsp, start, timeout: float = 90) -> None:

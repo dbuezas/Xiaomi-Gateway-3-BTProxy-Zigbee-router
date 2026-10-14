@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
+from homeassistant.loader import async_get_integration
 
 from .const import DOMAIN, SUPPORTED_FIRMWARES, SUPPORTED_MODELS
 from .coordinator import GatewayCoordinator
@@ -39,8 +40,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: GatewayConfigEntry) -> b
     registry = er.async_get(hass)
     if old := registry.async_get_entity_id("button", DOMAIN, f"{entry.unique_id}_join_zigbee"):
         registry.async_remove(old)
-    coordinator = GatewayCoordinator(hass, entry, gateway)
-    await coordinator.async_load()
+    await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()  # up to 0.4.x: the router's boot id
+    version = str((await async_get_integration(hass, DOMAIN)).version)
+    coordinator = GatewayCoordinator(hass, entry, gateway, version)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -57,4 +59,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: GatewayConfigEntry) -> 
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: GatewayConfigEntry) -> None:
-    await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()
+    await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()  # up to 0.4.x: the router's boot id
+    # the Zigbee router host keeps the chip's only connection; the chip keeps routing without it
+    try:
+        await Gateway(entry.data[CONF_HOST]).zigbee_host("stop")
+    except GatewayError as err:
+        _LOGGER.warning("Could not stop the Zigbee router host on the gateway: %s", err)

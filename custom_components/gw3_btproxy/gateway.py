@@ -7,6 +7,7 @@ import hashlib
 import logging
 import re
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiohttp import web
@@ -29,6 +30,31 @@ class UnsupportedModel(GatewayError):
 
 class UnsupportedFirmware(UnsupportedModel):
     """The gateway runs a firmware this integration was not tested on."""
+
+
+@dataclass
+class HostStatus:
+    """The status line of gw3-zigbee.sh: "<state> pid=... version=... [ieee=... nwk=...]", "exited <that line>"
+    or "none". States: up, starting, error <why>, refused <why> (it gave up), stopped."""
+
+    running: bool
+    state: str  # first word; "none" when it has not run since the gateway booted
+    detail: str = ""  # the reason after "error" / "refused"
+    version: str = ""
+    ieee: str = ""
+    pid: str = ""
+
+    @classmethod
+    def parse(cls, line: str) -> HostStatus:
+        words = line.split()
+        running = not words or words[0] != "exited"
+        if not running:
+            words = words[1:]
+        if not words or words[0] == "none":
+            return cls(False, "none")
+        keys = dict(w.split("=", 1) for w in words[1:] if "=" in w)
+        detail = " ".join(w for w in words[1:] if "=" not in w)
+        return cls(running, words[0], detail, keys.get("version", ""), keys.get("ieee", ""), keys.get("pid", ""))
 
 
 class Gateway:
@@ -119,16 +145,11 @@ class Gateway:
             raise GatewayError(f"gw3-btproxy.sh {action}: {lines[-1]}")
         return lines[-1:] == ["on"]
 
-    async def boot_id(self) -> str:
-        """The kernel's boot id plus the openmiio_agent pid; either change can reset the Zigbee chip."""
-        out = await self.run(
-            'echo $(cat /proc/sys/kernel/random/boot_id) '
-            '$(ps | grep "openmiio_agent" | grep -v grep | awk "{print \\$1}")'
-        )
-        boot, _, pid = out.strip().partition(" ")
-        if not boot:
-            raise GatewayError("no boot id")
-        return f"{boot}:{pid}"
+    async def zigbee_host(self, action: str, args: str = "") -> HostStatus:
+        """Run gw3-zigbee.sh start|stop|status: the Zigbee router host on the gateway."""
+        out = await self.run(f"sh {GW_DIR}/gw3-zigbee.sh {action} {args}".rstrip(), timeout=60)
+        lines = out.strip().splitlines()
+        return HostStatus.parse(lines[-1] if lines else "")
 
     async def zigbee_tcp(self) -> bool:
         """openmiio_agent serves the Zigbee chip on TCP 8888 (Xiaomi Gateway 3 integration in ZHA mode)."""

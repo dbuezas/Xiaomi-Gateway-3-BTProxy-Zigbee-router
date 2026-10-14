@@ -23,6 +23,9 @@ this binary on the gateway and switches between it and Xiaomi's own Bluetooth ap
 | `api.go` | ESPHome native API server: clients, send queues, request dispatch |
 | `proto.go` | The minimal protobuf encoding the API needs |
 | `serial_linux.go`, `serial_other.go` | UART setup on the gateway; a stub elsewhere |
+| `zigbee.go` | `gw3-btproxy zigbee`: the Zigbee router host (see below) |
+| `ezsp.go`, `ash.go` | EZSP v7 commands and callbacks, over ASH (framing, CRC, acknowledgements) |
+| `gateway_io.go` | The gateway's RGB LED (GPIOs) and button (`/dev/input/event0`) |
 
 ## Build
 
@@ -59,7 +62,38 @@ The version reported to Home Assistant comes from the integration's `manifest.js
 | `-tag` | | ignored; `-tag silabs_ncp_bt` makes `daemon_miio.sh` treat the proxy as its BT app |
 | `-v` | off | debug logging |
 
-## What I found about the chip
+## Zigbee router host
+
+`gw3-btproxy zigbee` is a second mode of the same binary: the host of the gateway's Zigbee chip while it is a
+router in ZHA (the main README explains why). `../gateway/gw3-zigbee.sh` starts and stops it.
+
+| Flag | Default | |
+| --- | --- | --- |
+| `-tcp` | `127.0.0.1:8888` | the chip, as openmiio_agent serves it |
+| `-epid`, `-pan`, `-channel` | | the network the chip must be a router in (decimal PAN ID); without them, any |
+| `-status` | `/tmp/gw3-zigbee.status` | status line for the integration |
+| `-button` | `/dev/input/event0` | the gateway's button (empty: none) |
+| `-v` | off | debug logging (every ZCL frame in and out) |
+
+It gives up (exit code 2) when the chip has no network stored, is not a router, routes for another network, or
+left the network (ZHA removed it); the integration starts it again only after a backoff (4 minutes, doubling up to
+an hour). On other errors, also when the chip resets by itself, it connects again after 5 s, doubling up to a
+minute.
+
+What I found about the Zigbee chip:
+
+- EZSP 7, stack 6.6.2 (`0x6620`). After the version command, every frame has the EZSP 5..7 header
+  (sequence, frame control, `0xFF`, `0x00`, frame id), as bellows' v5 handler sends it.
+- After a reset the chip sends garbled messages (correct first 11 bytes, then stale buffer memory) until
+  `CONFIG_PACKET_BUFFER_COUNT` is set. The EZSP `echo` command is not affected, so it is the chip's packet buffers,
+  not the link.
+- The chip answers ZDO requests (node, active endpoints, simple descriptor) itself, from the endpoint added with
+  `addEndpoint`; the host only answers ZCL.
+- The button driver reports key 102 with value 0 when pressed and 1 when released. `basic_gw` reads it too, without
+  a grab.
+- The LED is one RGB LED: GPIO 57 red, 56 green, 54 blue (`/bin/set_led.sh r g b`), each only on or off.
+
+## What I found about the Bluetooth chip
 
 - Silicon Labs chip, BGAPI at 115200 baud: Bluetooth stack 2.13.8 with gateway firmware 1.5.0_0102 (chip
   firmware 1.3.0), 2.13.10 with 1.5.4_0090 (chip firmware 1.4.0; the gateway update flashes the chip too). Same

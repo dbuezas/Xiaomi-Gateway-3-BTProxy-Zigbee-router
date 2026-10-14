@@ -27,6 +27,11 @@ func debugf(format string, a ...any) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "zigbee" {
+		log.SetFlags(log.Ltime | log.Lmicroseconds)
+		zigbeeMain(os.Args[2:])
+		return
+	}
 	serialPath := flag.String("serial", "/dev/ttyS1", "BT chip UART")
 	tcpAddr := flag.String("tcp", "", "use a TCP bridge to the UART instead (host:port), for development")
 	rtscts := flag.Bool("rtscts", false, "hardware flow control on the UART (RTS/CTS), switched on once the chip raises CTS")

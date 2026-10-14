@@ -9,7 +9,8 @@ standard Home Assistant setup:
   it like any ESPHome proxy, for every Bluetooth device, not only Xiaomi ones (I use it for my eQ-3
   thermostats). The proxy runs on the gateway itself.
 - **Zigbee router:** the gateway's Zigbee chip joins your existing ZHA network as a router and extends
-  the mesh.
+  the mesh. In ZHA it is a named device: the gateway's LED as a colour light, an Identify button, and the gateway's
+  button as a Zigbee remote. This part runs on the gateway itself too.
 
 Both are optional and independent.
 
@@ -35,7 +36,7 @@ Both are optional and independent.
 3. [![Add the integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=gw3_btproxy)
    Enter the gateway's IP address (it is suggested if the Xiaomi Gateway 3 integration is set up).
 
-The integration copies the proxy to the gateway's `/data` and keeps it up to date.
+The integration copies the proxy and its two scripts to the gateway's `/data` and keeps them up to date.
 
 ## Use
 
@@ -48,6 +49,28 @@ The device "Xiaomi Gateway 3 radios" has three entities:
 | **Zigbee router state** (sensor) | `off`, `up` or `error`. After a gateway reboot the integration brings the router back by itself. |
 
 Both settings persist: the Bluetooth mode is saved on the gateway, the Zigbee router setting in the integration.
+
+### The router in ZHA
+
+ZHA shows the router as **Xiaomi Gateway 3 Zigbee router**, online, with these entities:
+
+| Entity | What it does |
+|---|---|
+| **Light** | The gateway's RGB LED. Each of red, green and blue is only on or off, so it shows 7 colours: a colour picked in Home Assistant becomes the nearest of them. No brightness. On shows the last colour (white at first). Xiaomi's own app also sets it (blue while it runs). ZHA names it after the device, so I renamed mine to "LED". |
+| **Identify** (button) | Blinks the LED white. |
+
+The gateway's button (endpoint 2): a short press (under 2 s) sends an On/Off Toggle command. ZHA turns it into a
+`zha_event` (command `toggle`, endpoint 2) for automations. The command also goes to every device bound to that
+endpoint's On/Off cluster in ZHA, without WiFi or Home Assistant in the path. Long presses stay Xiaomi's. I tested
+the button with ZHA; I did not test bindings yet.
+
+When ZHA does not know the router's current endpoints (it met the router before 0.5.0, as "unk_manufacturer
+unk_model", or an older layout), the integration asks ZHA once to read it again. ZHA's **Reconfigure** button does
+the same.
+
+The integration's device "Xiaomi Gateway 3 radios" has the gateway's MAC address and, once the router is up, the
+chip's Zigbee address as connections. Home Assistant links it by them with the Xiaomi Gateway 3 integration's device
+and with ZHA's.
 
 ### Going back to the gateway's own Zigbee network
 
@@ -69,7 +92,8 @@ brings back after the next gateway reboot.
 
 Each one tested on my gateway: switching both ways, a proxy crash (Xiaomi's app comes back), a reboot with the
 boot hook, the API test (adverts, connect, GATT read, write, notify), cancelling a pending connect, the Zigbee router
-(on 1.5.0_0026 only on the gateway side: its scripts are identical to 1.5.0_0102's).
+(on 1.5.0_0026 only on the gateway side: its scripts are identical to 1.5.0_0102's). The Zigbee router's host on the
+gateway (version 0.5.0) is tested on 1.5.4_0090 only.
 
 | Firmware | Bluetooth chip | Hardware flow control | Lost bytes in 3 min |
 | --- | --- | --- | --- |
@@ -142,15 +166,29 @@ To undo, delete `/data/scripts/startup.sh`.
 
 ### Zigbee
 
-In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet NCP, EZSP v7) on TCP port
-8888. The integration talks to it with `bellows`, the library ZHA uses for these chips:
+In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet 6.6.2 NCP, EZSP v7) on TCP port
+8888, one connection at a time. Every connection resets the chip. The chip keeps its network across resets, but
+like every NCP it only brings it up when a host calls `networkInit`, with stack profile 2 and security level 5 set
+first (otherwise it answers NOT_JOINED). Two programs talk to it:
 
-- Joining uses the well-known default trust center link key (`ZigBeeAlliance09`), as ZHA expects.
-- Once joined, the chip routes on its own. No host needs to stay connected.
-- The chip keeps the network across resets, but like every NCP it only brings it up when a host calls
-  `networkInit`, with stack profile 2 and security level 5 set first (otherwise it answers NOT_JOINED).
-  The integration does that whenever the gateway reboots (kernel boot id) or the openmiio_agent process changes.
-- Any connection to port 8888 resets the chip, so the integration only connects when needed.
+- **The router host**, `gw3-btproxy zigbee` on the gateway, most of the time. It brings the network up, adds
+  two endpoints and answers them: 1 the LED (Basic, Identify, On/Off, Level Control, Color Control), 2 the button
+  (an On/Off client, on its own endpoint marked as a switch: on the light's endpoint ZHA adds an "Opening" sensor
+  for it). It first checks that the chip
+  is a router in ZHA's network (the integration passes the extended PAN ID, PAN ID and channel); otherwise it resets
+  the chip and gives up. When its connection drops (openmiio_agent restarted), it connects again by itself. It uses
+  about 3.3 MB of RAM. `gateway/gw3-zigbee.sh start|stop|status` runs it; its log goes to syslog (`<ZB>`).
+- **The integration**, with `bellows` (the library ZHA uses for these chips), to join, leave, back up and restore.
+  It stops the host first. Joining uses the well-known default trust center link key (`ZigBeeAlliance09`), as ZHA
+  expects.
+
+While nobody is connected, the chip keeps routing. After a gateway reboot the integration starts the host again
+within ~2 minutes (it needs Home Assistant and telnet for that).
+
+After a reset the chip has few packet buffers: the messages it sends are garbled after their first 11 bytes until a
+host sets `CONFIG_PACKET_BUFFER_COUNT` to 0xFF (all free memory), as bellows does. The host and the integration both
+set it. Up to 0.4.x the router ran with the default buffers (I did not check whether that also garbled the messages
+it relayed).
 
 ## Development
 
