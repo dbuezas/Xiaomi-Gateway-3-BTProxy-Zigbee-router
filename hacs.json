@@ -1,5 +1,7 @@
 {
   "name": "Xiaomi Gateway 3 BT proxy & Zigbee router",
   "render_readme": true,
-  "homeassistant": "2025.1.0"
+  "homeassistant": "2025.1.0",
+  "zip_release": true,
+  "filename": "gw3_btproxy.zip"
 }

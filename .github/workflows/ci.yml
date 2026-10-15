@@ -1,0 +1,88 @@
+# Checks every push and pull request: HACS validation, hassfest, the proxy's tests, and that the committed gateway
+# files are what the source builds.
+# A push to main that changes the version in manifest.json also makes a release once every check passes: tag
+# v<version>, the integration as gw3_btproxy.zip (HACS installs that file, so its download count counts installs),
+# notes from the commits since the previous tag. A version that already has a tag is left alone.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1" # weekly: HACS and hassfest rules change
+
+permissions:
+  contents: read
+
+jobs:
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: btproxy/go.mod
+          cache-dependency-path: btproxy/go.sum
+      - name: Test
+        working-directory: btproxy
+        run: |
+          go vet ./...
+          GOOS=linux GOARCH=mipsle go vet ./...
+          go test -race ./...
+      # The build is reproducible: the committed gateway files must be exactly what this source builds.
+      - name: Build and compare with the committed files
+        run: |
+          sh btproxy/build.sh
+          git diff --exit-code --stat custom_components/gw3_btproxy/bin || {
+            echo "custom_components/gw3_btproxy/bin is not what the source builds: run btproxy/build.sh and commit" >&2
+            exit 1
+          }
+
+  release:
+    needs: [hacs, hassfest, build]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version
+        id: version
+        run: |
+          V=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' custom_components/gw3_btproxy/manifest.json)
+          [ -n "$V" ] || { echo "no version in manifest.json" >&2; exit 1; }
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
+            echo "v$V is already released"
+          else
+            echo "new=1" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Zip
+        if: steps.version.outputs.new
+        run: cd custom_components/gw3_btproxy && zip -r -X "$GITHUB_WORKSPACE/gw3_btproxy.zip" . -x '__pycache__/*' '*.pyc'
+      - name: Release
+        if: steps.version.outputs.new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          git log --no-merges --format='- %s' ${PREV:+$PREV..}HEAD > notes.md
+          gh release create "$TAG" gw3_btproxy.zip --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
