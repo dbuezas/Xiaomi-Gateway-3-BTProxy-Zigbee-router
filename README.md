@@ -99,7 +99,7 @@ router. The Zigbee router's host on the gateway is tested on 1.5.4_0090 only.
 | 1.5.4_0090, 1.5.7_0001 | 1.4.0 | yes | 0 |
 
 Updating the gateway firmware also flashes the Bluetooth chip. Not supported: everything before 1.5.4 (another
-watchdog and chip reset, and no hardware flow control: the gateway loses Bluetooth bytes; version 0.5.0 of this
+watchdog and chip reset, and no hardware flow control: the gateway loses Bluetooth bytes; version 0.4.0 of this
 integration still supports 1.5.0_0026, 1.5.0_0102 and 1.5.1_0032), and 1.5.5, 1.5.6 (I could not get them to
 test). AlexxIT's integration lists 1.5.7 as untested; on my gateway it worked, including Zigbee in ZHA mode.
 
