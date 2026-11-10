@@ -78,6 +78,9 @@ left the network (ZHA removed it); the integration starts it again only after a 
 an hour). On other errors, also when the chip resets by itself, it connects again after 5 s, doubling up to a
 minute.
 
+Like bellows on TCP ports, bring-up waits 2 s for an RSTACK the chip sends unasked before it sends RST, then 2.5 s
+for the answer, three times: up to 13.5 s before it fails with "no RSTACK from the chip".
+
 What I found about the Zigbee chip:
 
 - EZSP 7, stack 6.6.2 (`0x6620`). After the version command, every frame has the EZSP 5..7 header
