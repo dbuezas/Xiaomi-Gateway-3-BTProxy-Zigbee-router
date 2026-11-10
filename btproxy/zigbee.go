@@ -203,7 +203,7 @@ func (h *zigbeeHost) session() error {
 		if errors.As(err, &fatal) {
 			// the chip may have just brought up a network it must not run (a coordinator, another network):
 			// reset it, so that network is down again
-			if rerr := a.Reset(2 * time.Second); rerr != nil {
+			if rerr := a.Reset(0, 2*time.Second); rerr != nil {
 				logf("zigbee: could not reset the chip: %v", rerr)
 			}
 		}
@@ -233,7 +233,7 @@ func (h *zigbeeHost) session() error {
 
 func (h *zigbeeHost) bringUp() error {
 	e := h.ezsp
-	if err := e.ash.Reset(2 * time.Second); err != nil {
+	if err := e.ash.Reset(2*time.Second, 2500*time.Millisecond); err != nil { // bellows timings
 		return err
 	}
 	proto, stackType, stack, err := e.Version()

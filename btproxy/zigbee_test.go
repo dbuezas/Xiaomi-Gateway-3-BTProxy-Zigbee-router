@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -43,6 +44,10 @@ type fakeNCP struct {
 	rxSeq   byte
 	sent    chan []byte // EZSP frames from the host
 	dropAck int         // acknowledgements not sent (the host must retransmit)
+	rsts    atomic.Int32
+	boot    time.Duration // RST to RSTACK; an RST meanwhile starts over
+	booting *time.Timer
+	errored bool // answers RST with an ERROR frame first
 }
 
 func (n *fakeNCP) write(frame []byte) { _, _ = n.conn.Write(append(ashEncode(frame), ashFlag)) }
@@ -78,8 +83,15 @@ func (n *fakeNCP) run() {
 		c := f[0]
 		switch {
 		case c == ashRST:
+			n.rsts.Add(1)
 			n.txSeq, n.rxSeq = 0, 0
-			n.write([]byte{ashRSTACK, 2, 0x0B})
+			if n.errored {
+				n.write([]byte{ashERROR, 2, 0x51})
+			}
+			if n.booting != nil {
+				n.booting.Stop()
+			}
+			n.booting = time.AfterFunc(n.boot, func() { n.write([]byte{ashRSTACK, 2, 0x0B}) })
 		case c&0x80 == 0:
 			if c>>4&7 != n.rxSeq {
 				continue // a retransmission of a frame already taken
@@ -134,7 +146,7 @@ func TestEZSPOverASH(t *testing.T) {
 		}
 		return []byte{0}
 	})
-	if err := e.ash.Reset(time.Second); err != nil {
+	if err := e.ash.Reset(0, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	proto, _, stack, err := e.Version()
@@ -171,6 +183,48 @@ func TestEZSPOverASH(t *testing.T) {
 	case <-e.ash.Lost:
 	case <-time.After(time.Second):
 		t.Fatal("unsolicited RSTACK not noticed")
+	}
+}
+
+// TestResetStartup takes the RSTACK a chip sends after a reset of its own, even before Reset is called, without
+// sending RST.
+func TestResetStartup(t *testing.T) {
+	e, n := newPair(t, nil)
+	n.write([]byte{ashRSTACK, 2, 0x02})
+	if err := e.ash.Reset(time.Second, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if r := n.rsts.Load(); r != 0 {
+		t.Fatalf("%d RSTs sent", r)
+	}
+}
+
+// TestResetSlowChip: a chip that takes longer than the RSTACK timeout to start, and starts over on every RST.
+func TestResetSlowChip(t *testing.T) {
+	e, n := newPair(t, nil)
+	n.boot = 300 * time.Millisecond
+	if err := e.ash.Reset(0, 200*time.Millisecond); err == nil {
+		t.Fatal("an RST every 200 ms let the chip start")
+	}
+	e, n = newPair(t, nil)
+	n.boot = 300 * time.Millisecond
+	if err := e.ash.Reset(200*time.Millisecond, 200*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if r := n.rsts.Load(); r != 1 {
+		t.Fatalf("%d RSTs sent", r)
+	}
+}
+
+// TestResetError: an ERROR frame during the reset does not fail the link.
+func TestResetError(t *testing.T) {
+	e, n := newPair(t, func(byte, []byte) []byte { return []byte{7, 2, 0x30, 0x65} })
+	n.errored = true
+	if err := e.ash.Reset(0, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := e.Version(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -222,7 +276,7 @@ func TestVersion13(t *testing.T) {
 		}
 		return []byte{0}
 	})
-	if err := e.ash.Reset(time.Second); err != nil {
+	if err := e.ash.Reset(0, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	proto, _, stack, err := e.Version()
@@ -254,7 +308,7 @@ func TestVersion13(t *testing.T) {
 
 func TestVersionUnsupported(t *testing.T) {
 	e, n := newPair(t, func(id byte, p []byte) []byte { return []byte{14, 2, 0x00, 0x80} })
-	if err := e.ash.Reset(time.Second); err != nil {
+	if err := e.ash.Reset(0, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	proto, _, _, err := e.Version()
@@ -269,7 +323,7 @@ func TestVersionUnsupported(t *testing.T) {
 
 func TestAddEndpointLayout(t *testing.T) {
 	e, n := newPair(t, func(byte, []byte) []byte { return []byte{0} })
-	if err := e.ash.Reset(time.Second); err != nil {
+	if err := e.ash.Reset(0, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	e.protocol = 7 // as after the version command
@@ -295,7 +349,7 @@ func TestAddEndpointLayout(t *testing.T) {
 // TestEndpoint answers a Read Attributes of the Basic cluster as ZHA's interview sends it.
 func TestEndpoint(t *testing.T) {
 	e, n := newPair(t, func(id byte, p []byte) []byte { return []byte{0, 0} })
-	if err := e.ash.Reset(time.Second); err != nil {
+	if err := e.ash.Reset(0, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	e.protocol = 7 // as after the version command

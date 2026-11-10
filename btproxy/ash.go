@@ -126,7 +126,7 @@ type ASH struct {
 	reject  bool          // a NAK was sent and no good DATA frame came since
 	failed  error         // the link is gone (port error, ERROR frame, a reset nobody asked for)
 	Lost    chan struct{} // closed when failed is set
-	reset   bool          // Reset is waiting for an RSTACK
+	reset   bool          // waiting for an RSTACK: from the start, until Reset returns
 	done    chan struct{} // closed when Run returns
 	sendMu  sync.Mutex    // one DATA frame in flight
 	timeout time.Duration // current ACK timeout
@@ -136,7 +136,7 @@ func NewASH(rw io.ReadWriter, recv func([]byte)) *ASH {
 	return &ASH{
 		w: rw, r: bufio.NewReaderSize(rw, 512), recv: recv,
 		acked: make(chan byte, 8), rstack: make(chan byte, 1), done: make(chan struct{}), Lost: make(chan struct{}),
-		timeout: 1600 * time.Millisecond,
+		timeout: 1600 * time.Millisecond, reset: true,
 	}
 }
 
@@ -248,6 +248,13 @@ func (a *ASH) frame(stuffed []byte) {
 		default:
 		}
 	case c == ashERROR && len(f) == 3:
+		a.mu.Lock()
+		resetting := a.reset
+		a.mu.Unlock()
+		if resetting { // as bellows: ignored during a reset, which clears the error state
+			debugf("zigbee: ash: ERROR frame (code 0x%02X) during reset, ignored", f[2])
+			return
+		}
 		a.fail(fmt.Errorf("ash: chip in error state (code 0x%02X)", f[2]))
 		select {
 		case a.acked <- 0xFF:
@@ -273,8 +280,10 @@ func (a *ASH) ackReceived(ackNum byte) {
 	}
 }
 
-// Reset resets the chip (as every host connection does) and waits for its RSTACK.
-func (a *ASH) Reset(timeout time.Duration) error {
+// Reset resets the chip (as every host connection does) and waits for its RSTACK. As bellows does on TCP ports,
+// each try first waits for an RSTACK without sending anything: one the chip sends after a reset of its own, or a
+// late one from the previous RST. Another RST while the chip still starts would only restart it.
+func (a *ASH) Reset(wait, timeout time.Duration) error {
 	a.mu.Lock()
 	a.reset = true
 	a.mu.Unlock()
@@ -284,9 +293,13 @@ func (a *ASH) Reset(timeout time.Duration) error {
 		a.mu.Unlock()
 	}()
 	for try := 0; try < 3; try++ {
-		select { // a stale RSTACK
-		case <-a.rstack:
-		default:
+		select {
+		case code := <-a.rstack:
+			debugf("zigbee: chip reset by itself (code 0x%02X)", code)
+			return nil
+		case <-a.done:
+			return a.err()
+		case <-time.After(wait):
 		}
 		a.wmu.Lock()
 		_, err := a.w.Write(append(append(make([]byte, 0, 40), cancels32[:]...), append(ashEncode([]byte{ashRST}), ashFlag)...))
