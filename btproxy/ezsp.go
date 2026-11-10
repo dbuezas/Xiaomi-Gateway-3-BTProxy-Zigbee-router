@@ -1,8 +1,7 @@
 package main
 
-// EZSP version 7 (the gateway's EmberZNet NCP firmware, stack 6.6.2). Frames: sequence, frame control, 0xFF, 0x00,
-// frame id; only the version command (always the first) is sequence, frame control, frame id. Only the commands
-// and callbacks the Zigbee router needs. Layouts as in bellows/ezsp/v4..v7/commands.py.
+// EZSP 7 (the gateway's stock EmberZNet 6.6.2) to 13 (EmberZNet 7.x). Only the commands and callbacks the Zigbee
+// router needs; their layouts are the same in all of these versions (bellows/ezsp/v4..v13/commands.py).
 
 import (
 	"encoding/binary"
@@ -32,10 +31,12 @@ const (
 	ezspSecurityState     = 0x69
 	ezspInvalidCommand    = 0x58
 	ezspCmdTimeout        = 5 * time.Second
-	ezspProtocolVersion   = 7
+	ezspProtocolVersion   = 7  // asked for first
+	ezspMaxProtocol       = 13 // EZSP 14 changes command layouts (sl_Status)
 	ezspConfigPacketBufs  = 0x01
 	ezspConfigStackProf   = 0x0C
 	ezspConfigSecLevel    = 0x0D
+	ezspErrInvalidID      = 0x37
 	emberSuccess          = 0x00
 	emberNetworkUp        = 0x90
 	emberNetworkDown      = 0x91
@@ -76,12 +77,12 @@ func parseAPS(b []byte) (APSFrame, bool) {
 
 // Callback is an asynchronous frame from the chip.
 type Callback struct {
-	ID   byte
+	ID   uint16
 	Data []byte
 }
 
 type ezspReply struct {
-	id   byte
+	id   uint16
 	data []byte
 }
 
@@ -91,6 +92,7 @@ type EZSP struct {
 	cmdMu     sync.Mutex
 	mu        sync.Mutex
 	seq       byte
+	protocol  byte           // frame format: 0 legacy (until a version command is answered), else the EZSP version
 	wait      chan ezspReply // the reply to the command in flight
 	waitSeq   byte
 	waiting   bool
@@ -101,17 +103,40 @@ func NewEZSP() *EZSP {
 	return &EZSP{Callbacks: make(chan Callback, 32)}
 }
 
+// ezspHeader is the frame header for a protocol version (bellows v4, v5 and v8 _ezsp_frame_tx).
+func ezspHeader(protocol, seq byte, id uint16) []byte {
+	switch {
+	case protocol == 0:
+		return []byte{seq, 0x00, byte(id)}
+	case protocol < 8:
+		return []byte{seq, 0x00, 0xFF, 0x00, byte(id)}
+	}
+	return []byte{seq, 0x00, 0x01, byte(id), byte(id >> 8)}
+}
+
+// ezspParse splits a frame from the chip into sequence, frame control (low byte), frame id and parameters.
+func ezspParse(protocol byte, f []byte) (seq, fc byte, id uint16, data []byte, ok bool) {
+	switch {
+	case protocol >= 8 && len(f) >= 5:
+		return f[0], f[1], binary.LittleEndian.Uint16(f[3:]), f[5:], true
+	case protocol >= 8 || len(f) < 3:
+		return 0, 0, 0, nil, false
+	case f[2] != 0xFF: // legacy: the reply to the first version command
+		return f[0], f[1], uint16(f[2]), f[3:], true
+	case len(f) >= 5:
+		return f[0], f[1], uint16(f[4]), f[5:], true
+	}
+	return 0, 0, 0, nil, false
+}
+
 // Received is the ASH recv callback.
 func (e *EZSP) Received(f []byte) {
-	if len(f) < 3 {
+	e.mu.Lock()
+	protocol := e.protocol
+	e.mu.Unlock()
+	seq, fc, id, data, ok := ezspParse(protocol, f)
+	if !ok {
 		return
-	}
-	seq, fc, id, data := f[0], f[1], f[2], f[3:]
-	if id == 0xFF { // EZSP 5..7 after the version command: 0xFF, 0x00 (frame control high byte), then the id
-		if len(f) < 5 {
-			return
-		}
-		id, data = f[4], f[5:]
 	}
 	if fc&0x18 != 0 { // callback (synchronous or asynchronous)
 		select {
@@ -122,7 +147,7 @@ func (e *EZSP) Received(f []byte) {
 		return
 	}
 	e.mu.Lock()
-	ok := e.waiting && seq == e.waitSeq
+	ok = e.waiting && seq == e.waitSeq
 	if ok {
 		e.waiting = false
 	}
@@ -136,7 +161,7 @@ func (e *EZSP) Received(f []byte) {
 }
 
 // Command sends a command and returns its reply's parameters.
-func (e *EZSP) Command(id byte, params []byte) ([]byte, error) {
+func (e *EZSP) Command(id uint16, params []byte) ([]byte, error) {
 	e.cmdMu.Lock()
 	defer e.cmdMu.Unlock()
 	w := make(chan ezspReply, 1)
@@ -144,16 +169,13 @@ func (e *EZSP) Command(id byte, params []byte) ([]byte, error) {
 	seq := e.seq
 	e.seq++
 	e.wait, e.waitSeq, e.waiting = w, seq, true
+	head := ezspHeader(e.protocol, seq, id)
 	e.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
 		e.waiting = false
 		e.mu.Unlock()
 	}()
-	head := []byte{seq, 0x00, 0xFF, 0x00, id} // EZSP 5..7 frame (bellows v5 _ezsp_frame_tx)
-	if id == ezspVersion {
-		head = []byte{seq, 0x00, id} // the version command always has the legacy format
-	}
 	if err := e.ash.Send(append(head, params...)); err != nil {
 		return nil, err
 	}
@@ -181,7 +203,7 @@ func first(b []byte) byte {
 }
 
 // status runs a command whose reply starts with a status byte, and fails unless it is 0.
-func (e *EZSP) status(name string, id byte, params []byte) ([]byte, error) {
+func (e *EZSP) status(name string, id uint16, params []byte) ([]byte, error) {
 	r, err := e.Command(id, params)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
@@ -208,13 +230,36 @@ func isStatus(err error, status byte) bool {
 	return errors.As(err, &s) && s.Status == status
 }
 
+// Version negotiates the protocol as bellows does: the first version command (legacy format) asks for EZSP 7; a
+// chip with another version answers with it, and a supported one is asked again for it, in that version's format.
+// The caller checks the returned protocol.
 func (e *EZSP) Version() (protocol, stackType byte, stack uint16, err error) {
-	r, err := e.Command(ezspVersion, []byte{ezspProtocolVersion})
+	protocol, stackType, stack, err = e.version(ezspProtocolVersion)
+	if err != nil || protocol <= ezspProtocolVersion || protocol > ezspMaxProtocol {
+		return
+	}
+	want := protocol
+	e.mu.Lock()
+	e.protocol = want
+	e.mu.Unlock()
+	if protocol, stackType, stack, err = e.version(want); err == nil && protocol != want {
+		err = fmt.Errorf("version: asked for EZSP %d, the chip answered %d", want, protocol)
+	}
+	return
+}
+
+func (e *EZSP) version(want byte) (protocol, stackType byte, stack uint16, err error) {
+	r, err := e.Command(ezspVersion, []byte{want})
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("version: %w", err)
 	}
 	if len(r) < 4 {
 		return 0, 0, 0, errors.New("version: short reply")
+	}
+	if r[0] == want {
+		e.mu.Lock()
+		e.protocol = want
+		e.mu.Unlock()
 	}
 	return r[0], r[1], binary.LittleEndian.Uint16(r[2:]), nil
 }

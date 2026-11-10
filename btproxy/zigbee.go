@@ -241,8 +241,8 @@ func (h *zigbeeHost) bringUp() error {
 		return err
 	}
 	debugf("zigbee: EZSP %d, stack type %d, stack 0x%04X", proto, stackType, stack)
-	if proto != ezspProtocolVersion {
-		return fatalError{fmt.Errorf("the chip speaks EZSP %d, not %d", proto, ezspProtocolVersion)}
+	if proto < ezspProtocolVersion || proto > ezspMaxProtocol {
+		return fatalError{fmt.Errorf("the chip speaks EZSP %d, not %d..%d", proto, ezspProtocolVersion, ezspMaxProtocol)}
 	}
 	// as the integration does before every networkInit: otherwise the chip answers NOT_JOINED
 	if err := e.SetConfig(ezspConfigStackProf, 2); err != nil {
@@ -253,7 +253,10 @@ func (h *zigbeeHost) bringUp() error {
 	}
 	// All free configuration RAM to packet buffers, set last (as bellows does). With the chip's default, messages
 	// it sends are garbled after their first 11 bytes (seen on this chip: the rest is stale buffer memory).
-	if err := e.SetConfig(ezspConfigPacketBufs, 0xFF); err != nil {
+	// EmberZNet 7.x has no such setting and answers ERROR_INVALID_ID.
+	if err := e.SetConfig(ezspConfigPacketBufs, 0xFF); isStatus(err, ezspErrInvalidID) {
+		debugf("zigbee: %v", err)
+	} else if err != nil {
 		logf("zigbee: %v (messages from the chip may be garbled)", err)
 	}
 	if err := e.AddEndpoint(zbEndpoint, zbProfileHA, zbDeviceType, []uint16{clBasic, clIdentify, clOnOff, clLevel, clColor}, nil); err != nil {
