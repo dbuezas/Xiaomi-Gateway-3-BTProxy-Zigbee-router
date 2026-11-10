@@ -165,10 +165,10 @@ To undo, delete `/data/scripts/startup.sh`.
 
 ### Zigbee
 
-In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet 6.6.2 NCP, EZSP v7) on TCP port
-8888, one connection at a time. Every connection resets the chip. The chip keeps its network across resets, but
-like every NCP it only brings it up when a host calls `networkInit`, with stack profile 2 and security level 5 set
-first (otherwise it answers NOT_JOINED). Two programs talk to it:
+In ZHA mode, openmiio_agent serves the gateway's Zigbee chip (EmberZNet NCP: stock 6.6.2 with EZSP 7, or a 7.x
+update with EZSP up to 13) on TCP port 8888, one connection at a time. Every connection resets the chip. The chip
+keeps its network across resets, but like every NCP it only brings it up when a host calls `networkInit`, with
+stack profile 2 and security level 5 set first (otherwise it answers NOT_JOINED). Two programs talk to it:
 
 - **The router host**, `gw3-btproxy zigbee` on the gateway, most of the time. It brings the network up, adds
   two endpoints and answers them: 1 the LED (Basic, Identify, On/Off, Level Control, Color Control), 2 the button
@@ -184,10 +184,10 @@ first (otherwise it answers NOT_JOINED). Two programs talk to it:
 While nobody is connected, the chip keeps routing. After a gateway reboot the integration starts the host again
 within ~2 minutes (it needs Home Assistant and telnet for that).
 
-After a reset the chip has few packet buffers: the messages it sends are garbled after their first 11 bytes until a
-host sets `CONFIG_PACKET_BUFFER_COUNT` to 0xFF (all free memory), as bellows does. The host and the integration both
-set it. Up to 0.4.x the router ran with the default buffers (I did not check whether that also garbled the messages
-it relayed).
+After a reset the stock chip has few packet buffers: the messages it sends are garbled after their first 11 bytes
+until a host sets `CONFIG_PACKET_BUFFER_COUNT` to 0xFF (all free memory), as bellows does. The host and the
+integration both set it (EmberZNet 7.x has no such setting). Up to 0.4.x the router ran with the default buffers (I
+did not check whether that also garbled the messages it relayed).
 
 ## Development
 
