@@ -199,6 +199,25 @@ func TestResetStartup(t *testing.T) {
 	}
 }
 
+// TestResetStale: Reset(0, …) sends RST even with an older RSTACK buffered (the fatal path must take the network down).
+func TestResetStale(t *testing.T) {
+	for i := 0; i < 10; i++ { // without the drain, select picks the stale RSTACK about half the time
+		e, n := newPair(t, nil)
+		n.write([]byte{ashRSTACK, 2, 0x02})
+		for deadline := time.Now().Add(time.Second); len(e.ash.rstack) == 0; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("stale RSTACK not buffered")
+			}
+		}
+		if err := e.ash.Reset(0, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if r := n.rsts.Load(); r != 1 {
+			t.Fatalf("%d RSTs sent", r)
+		}
+	}
+}
+
 // TestResetSlowChip: a chip that takes longer than the RSTACK timeout to start, and starts over on every RST.
 func TestResetSlowChip(t *testing.T) {
 	e, n := newPair(t, nil)

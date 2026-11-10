@@ -292,6 +292,12 @@ func (a *ASH) Reset(wait, timeout time.Duration) error {
 		a.reset = false
 		a.mu.Unlock()
 	}()
+	if wait == 0 { // the caller needs a fresh reset: a buffered RSTACK predates it
+		select {
+		case <-a.rstack:
+		default:
+		}
+	}
 	for try := 0; try < 3; try++ {
 		select {
 		case code := <-a.rstack:
