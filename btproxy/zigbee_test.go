@@ -365,6 +365,28 @@ func TestAddEndpointLayout(t *testing.T) {
 	}
 }
 
+func TestSetPolicyLayout(t *testing.T) {
+	for _, c := range []struct {
+		protocol byte
+		want     []byte
+	}{
+		{7, []byte{0, 0, 0xFF, 0, ezspSetPolicy, 0x01, 0x11}},
+		{13, []byte{0, 0, 0x01, ezspSetPolicy, 0, 0x01, 0x11}},
+	} {
+		e, n := newPair(t, func(byte, []byte) []byte { return []byte{0} })
+		if err := e.ash.Reset(0, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		e.protocol = c.protocol
+		if err := e.SetPolicy(ezspPolicyBinding, ezspAllowBinding); err != nil {
+			t.Fatal(err)
+		}
+		if got := <-n.sent; !bytes.Equal(got, c.want) {
+			t.Errorf("EZSP %d setPolicy\n got % x\nwant % x", c.protocol, got, c.want)
+		}
+	}
+}
+
 // TestEndpoint answers a Read Attributes of the Basic cluster as ZHA's interview sends it.
 func TestEndpoint(t *testing.T) {
 	e, n := newPair(t, func(id byte, p []byte) []byte { return []byte{0, 0} })

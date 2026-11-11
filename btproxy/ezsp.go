@@ -27,6 +27,7 @@ const (
 	ezspMessageSent       = 0x3F // callback
 	ezspIncomingMessage   = 0x45 // callback
 	ezspSetConfigValue    = 0x53
+	ezspSetPolicy         = 0x55
 	ezspLookupNodeID      = 0x60
 	ezspSecurityState     = 0x69
 	ezspInvalidCommand    = 0x58
@@ -36,6 +37,8 @@ const (
 	ezspConfigPacketBufs  = 0x01
 	ezspConfigStackProf   = 0x0C
 	ezspConfigSecLevel    = 0x0D
+	ezspPolicyBinding     = 0x01 // BINDING_MODIFICATION_POLICY
+	ezspAllowBinding      = 0x11 // ALLOW_BINDING_MODIFICATION
 	ezspErrInvalidID      = 0x37
 	emberSuccess          = 0x00
 	emberNetworkUp        = 0x90
@@ -266,6 +269,11 @@ func (e *EZSP) version(want byte) (protocol, stackType byte, stack uint16, err e
 
 func (e *EZSP) SetConfig(id byte, value uint16) error {
 	_, err := e.status(fmt.Sprintf("setConfigurationValue 0x%02X", id), ezspSetConfigValue, binary.LittleEndian.AppendUint16([]byte{id}, value))
+	return err
+}
+
+func (e *EZSP) SetPolicy(id, decision byte) error {
+	_, err := e.status(fmt.Sprintf("setPolicy 0x%02X", id), ezspSetPolicy, []byte{id, decision})
 	return err
 }
 

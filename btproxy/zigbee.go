@@ -259,6 +259,11 @@ func (h *zigbeeHost) bringUp() error {
 	} else if err != nil {
 		logf("zigbee: %v (messages from the chip may be garbled)", err)
 	}
+	// The chip's default refuses every ZDO Bind_req. CHECK_BINDING_MODIFICATIONS_ARE_VALID_ENDPOINT_CLUSTERS would
+	// still refuse ZHA's binds of endpoint 1's server clusters: it only allows output clusters.
+	if err := e.SetPolicy(ezspPolicyBinding, ezspAllowBinding); err != nil {
+		logf("zigbee: %v (ZHA cannot bind to this router)", err)
+	}
 	if err := e.AddEndpoint(zbEndpoint, zbProfileHA, zbDeviceType, []uint16{clBasic, clIdentify, clOnOff, clLevel, clColor}, nil); err != nil {
 		return err
 	}
