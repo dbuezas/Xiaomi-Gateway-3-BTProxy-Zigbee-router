@@ -119,7 +119,9 @@ async def _configure(ezsp) -> None:
             raise ZigbeeError(f"setConfigurationValue {cid.name}: {status}")
     # packet buffers last, as bellows does: with the chip's default, the messages it sends are garbled
     (status,) = await ezsp.setConfigurationValue(t.EzspConfigId.CONFIG_PACKET_BUFFER_COUNT, 0xFF)
-    if status != t.EzspStatus.SUCCESS:
+    if status == t.EzspStatus.ERROR_INVALID_ID:  # EmberZNet 7.x has no such setting
+        _LOGGER.debug("setConfigurationValue CONFIG_PACKET_BUFFER_COUNT: %s", status)
+    elif status != t.EzspStatus.SUCCESS:
         _LOGGER.warning("setConfigurationValue CONFIG_PACKET_BUFFER_COUNT: %s", status)
 
 

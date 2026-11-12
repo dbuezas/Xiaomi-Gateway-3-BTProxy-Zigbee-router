@@ -203,7 +203,7 @@ func (h *zigbeeHost) session() error {
 		if errors.As(err, &fatal) {
 			// the chip may have just brought up a network it must not run (a coordinator, another network):
 			// reset it, so that network is down again
-			if rerr := a.Reset(2 * time.Second); rerr != nil {
+			if rerr := a.Reset(0, 2*time.Second); rerr != nil {
 				logf("zigbee: could not reset the chip: %v", rerr)
 			}
 		}
@@ -233,7 +233,7 @@ func (h *zigbeeHost) session() error {
 
 func (h *zigbeeHost) bringUp() error {
 	e := h.ezsp
-	if err := e.ash.Reset(2 * time.Second); err != nil {
+	if err := e.ash.Reset(2*time.Second, 2500*time.Millisecond); err != nil { // bellows timings
 		return err
 	}
 	proto, stackType, stack, err := e.Version()
@@ -241,8 +241,8 @@ func (h *zigbeeHost) bringUp() error {
 		return err
 	}
 	debugf("zigbee: EZSP %d, stack type %d, stack 0x%04X", proto, stackType, stack)
-	if proto != ezspProtocolVersion {
-		return fatalError{fmt.Errorf("the chip speaks EZSP %d, not %d", proto, ezspProtocolVersion)}
+	if proto < ezspProtocolVersion || proto > ezspMaxProtocol {
+		return fatalError{fmt.Errorf("the chip speaks EZSP %d, not %d..%d", proto, ezspProtocolVersion, ezspMaxProtocol)}
 	}
 	// as the integration does before every networkInit: otherwise the chip answers NOT_JOINED
 	if err := e.SetConfig(ezspConfigStackProf, 2); err != nil {
@@ -253,8 +253,16 @@ func (h *zigbeeHost) bringUp() error {
 	}
 	// All free configuration RAM to packet buffers, set last (as bellows does). With the chip's default, messages
 	// it sends are garbled after their first 11 bytes (seen on this chip: the rest is stale buffer memory).
-	if err := e.SetConfig(ezspConfigPacketBufs, 0xFF); err != nil {
+	// EmberZNet 7.x has no such setting and answers ERROR_INVALID_ID.
+	if err := e.SetConfig(ezspConfigPacketBufs, 0xFF); isStatus(err, ezspErrInvalidID) {
+		debugf("zigbee: %v", err)
+	} else if err != nil {
 		logf("zigbee: %v (messages from the chip may be garbled)", err)
+	}
+	// The chip's default refuses every ZDO Bind_req. CHECK_BINDING_MODIFICATIONS_ARE_VALID_ENDPOINT_CLUSTERS would
+	// still refuse ZHA's binds of endpoint 1's server clusters: it only allows output clusters.
+	if err := e.SetPolicy(ezspPolicyBinding, ezspAllowBinding); err != nil {
+		logf("zigbee: %v (ZHA cannot bind to this router)", err)
 	}
 	if err := e.AddEndpoint(zbEndpoint, zbProfileHA, zbDeviceType, []uint16{clBasic, clIdentify, clOnOff, clLevel, clColor}, nil); err != nil {
 		return err

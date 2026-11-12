@@ -24,7 +24,7 @@ this binary on the gateway and switches between it and Xiaomi's own Bluetooth ap
 | `proto.go` | The minimal protobuf encoding the API needs |
 | `serial_linux.go`, `serial_other.go` | UART setup on the gateway; a stub elsewhere |
 | `zigbee.go` | `gw3-btproxy zigbee`: the Zigbee router host (see below) |
-| `ezsp.go`, `ash.go` | EZSP v7 commands and callbacks, over ASH (framing, CRC, acknowledgements) |
+| `ezsp.go`, `ash.go` | EZSP 7..13 commands and callbacks, over ASH (framing, CRC, acknowledgements) |
 | `gateway_io.go` | The gateway's RGB LED (GPIOs) and button (`/dev/input/event0`) |
 
 ## Build
@@ -78,10 +78,17 @@ left the network (ZHA removed it); the integration starts it again only after a 
 an hour). On other errors, also when the chip resets by itself, it connects again after 5 s, doubling up to a
 minute.
 
+Like bellows on TCP ports, bring-up waits 2 s for an RSTACK the chip sends unasked before it sends RST, then 2.5 s
+for the answer, three times: up to 13.5 s before it fails with "no RSTACK from the chip".
+
 What I found about the Zigbee chip:
 
 - EZSP 7, stack 6.6.2 (`0x6620`). After the version command, every frame has the EZSP 5..7 header
   (sequence, frame control, `0xFF`, `0x00`, frame id), as bellows' v5 handler sends it.
+- EmberZNet 7.x (7.5.0: EZSP 13, `0x7500`) answers the first version command with its own version; the host then
+  asks for that one, and from then on every frame has the EZSP 8 header (sequence, frame control low and high
+  byte, 16-bit frame id), as bellows' v8 handler sends it. The commands the host uses are the same up to EZSP 13.
+  This firmware has no `CONFIG_PACKET_BUFFER_COUNT` (`ERROR_INVALID_ID`).
 - After a reset the chip sends garbled messages (correct first 11 bytes, then stale buffer memory) until
   `CONFIG_PACKET_BUFFER_COUNT` is set. The EZSP `echo` command is not affected, so it is the chip's packet buffers,
   not the link.
