@@ -62,7 +62,8 @@ ZHA shows the router as **Xiaomi Gateway 3 Zigbee router**, online, with these e
 The gateway's button (endpoint 2): a short press (under 2 s) sends an On/Off Toggle command. ZHA turns it into a
 `zha_event` (command `toggle`, endpoint 2) for automations. The command also goes to every device bound to that
 endpoint's On/Off cluster in ZHA, without WiFi or Home Assistant in the path. Long presses stay Xiaomi's. I tested
-the button with ZHA; I did not test bindings yet.
+the button with ZHA. ZHA's Reconfigure binds endpoint 1's On/Off, Level and Color clusters (tested on 1.5.7_0001 with
+EmberZNet 7.5.0); binding the button to other devices is not tested yet.
 
 When ZHA does not know the router's current endpoints (it met the router before 0.5.0, as "unk_manufacturer
 unk_model", or an older layout), the integration asks ZHA once to read it again. ZHA's **Reconfigure** button does
@@ -92,7 +93,8 @@ brings back after the next gateway reboot.
 
 Each one tested on my gateway: switching both ways, a proxy crash (Xiaomi's app comes back), a reboot with the
 boot hook, the API test (adverts, connect, GATT read, write, notify), cancelling a pending connect, the Zigbee
-router. The Zigbee router's host on the gateway is tested on 1.5.4_0090 only.
+router. The Zigbee router's host on the gateway is tested on 1.5.4_0090 with the stock EmberZNet 6.6.2 chip
+firmware, and on 1.5.7_0001 with EmberZNet 7.5.0.
 
 | Firmware | Bluetooth chip | Hardware flow control | Lost bytes in 3 min |
 | --- | --- | --- | --- |
